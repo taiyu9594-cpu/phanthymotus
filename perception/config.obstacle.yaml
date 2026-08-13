@@ -1,0 +1,49 @@
+mcp_port: 15720
+
+# 只运行 obstacle：关闭 agent-core 注册心跳
+register: false
+
+plugins:
+  asr:
+    enabled: false
+
+  tts:
+    enabled: false   # obstacle 镜像不含 TTS 模型
+    model_dir: /models/vits2-mix
+    speaker_id: 0
+    speed: 1.0
+
+  htmsg:
+    enabled: false
+
+  vop:
+    enabled: false
+
+  obstacle:
+    enabled: true
+    output_topic: "{input_topic}/obstacle"
+    lazy_load: true   # 按模式懒加载引擎，省显存（默认开）
+    provider: local
+    url: ""
+    key: ""
+    model: ""
+    decision_threshold_m: 2.0   # 准召线（P/R/F1 判定阈值）
+    model_dir: /models/obstacle
+    indoor:
+      engine: depth_anything_v2_metric_hypersim_vits_int8.trt
+      calib: calib_isotonic_d_roi_min.json
+      push_enabled: true
+      push_score_threshold_m: 1.86   # d_roi_min < 1.86 -> 压到 2m 线内（F1@2m 0.64->0.76）
+      classification_margin_m: 0.001
+    outdoor:
+      depth_engine: yolo26n-depth_int8.trt
+      seg_engine: yolo26n-seg_fp16.trt
+      allowed_classes: [0, 1, 2, 3, 5, 7]
+      min_confidence: 0.25
+      percentile: 1.0      # 对齐 zeng pct1（近距更敏感），5 折扫描最优
+      min_depth_m: 0.3
+      max_depth_m: 80.0
+      offset_m: 1.0
+      scale: 1.2          # zeng 风格；-2.0 比 zeng 原 -2.4 更优（F1@2m 0.5 / MAE 5.08）
+      bias: -2.0
+      fallback_distance_m: 3.0
