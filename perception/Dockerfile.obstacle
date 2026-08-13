@@ -17,9 +17,12 @@ RUN curl -fsSL -o /usr/lib/aarch64-linux-gnu/nvidia/libnvdla_compiler.so "${JETS
 # ── 模型/引擎下载（JuiceFS HTTP）────────────────────────────────
 ARG INDOOR_TRT_URL=http://172.28.4.81:34567/zhangjinghong/obstacle_val_trt
 ARG OUTDOOR_TRT_URL=http://172.28.4.81:34567/zhangjinghong/obstacle_val_trt_outdoor
+ARG TUM_CALIB_URL=http://172.28.4.81:34567/i-chentaiyu/obstacle_submit/calibration/calib_tum_compliant_isotonic_rescue.json
+ARG TUM_CALIB_SHA256=e553a61ff91138980b9b26496454205f4f807fa22267900014374b1ae9f66642
 RUN mkdir -p /models/obstacle && cd /models/obstacle && \
     curl -fsSL -o depth_anything_v2_metric_hypersim_vits_int8.trt "${INDOOR_TRT_URL}/depth_anything_v2_metric_hypersim_vits_int8.trt" && \
-    curl -fsSL -o calib_isotonic_d_roi_min.json "${INDOOR_TRT_URL}/calib_isotonic_d_roi_min.json" && \
+    curl -fsSL -o calib_tum_compliant_isotonic_rescue.json "${TUM_CALIB_URL}" && \
+    echo "${TUM_CALIB_SHA256}  calib_tum_compliant_isotonic_rescue.json" | sha256sum -c - && \
     curl -fsSL -o yolo26n-depth_int8.trt "${OUTDOOR_TRT_URL}/yolo26n-depth_int8.trt" && \
     curl -fsSL -o yolo26n-seg_fp16.trt "${OUTDOOR_TRT_URL}/yolo26n-seg_fp16.trt" && \
     echo "obstacle models:" && ls -lh /models/obstacle

@@ -28,10 +28,11 @@ plugins:
     model_dir: /models/obstacle
     indoor:
       engine: depth_anything_v2_metric_hypersim_vits_int8.trt
-      calib: calib_isotonic_d_roi_min.json
-      push_enabled: true
-      push_score_threshold_m: 1.86   # d_roi_min < 1.86 -> 压到 2m 线内（F1@2m 0.64->0.76）
-      classification_margin_m: 0.001
+      calib: calib_tum_compliant_isotonic_rescue.json
+      raw_baseline_threshold_m: 1.5826627612113953
+      rescue_upper_bound_m: 2.495905647277832
+      rescue_gap_threshold_m: 0.35293271780014046
+      rescue_distance_m: 1.99
     outdoor:
       depth_engine: yolo26n-depth_int8.trt
       seg_engine: yolo26n-seg_fp16.trt

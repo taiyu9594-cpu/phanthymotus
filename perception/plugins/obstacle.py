@@ -75,6 +75,11 @@ INDOOR_H, INDOOR_W = 518, 686
 INDOOR_ROI_ROWS = (0, 300)
 INDOOR_ROI_COLS = (213, 426)
 INDOOR_CLIP = (0.05, 50.0)
+RAW_BASELINE_THRESHOLD = 1.5826627612113953
+RESCUE_UPPER_BOUND = 2.495905647277832
+RESCUE_GAP_THRESHOLD = 0.35293271780014046
+RESCUE_DISTANCE = 1.99
+DECISION_THRESHOLD = 2.0
 
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
@@ -345,15 +350,15 @@ class ObstaclePlugin:
         self._output_topic_tpl = plugin_cfg.get("output_topic", "{input_topic}/obstacle")
         self._lazy_load = bool(plugin_cfg.get("lazy_load", True))
         _ind = plugin_cfg.get("indoor", {})
-        self._indoor_push_enabled = bool(_ind.get("push_enabled", True))
-        self._indoor_push_threshold = float(_ind.get("push_score_threshold_m", 1.86))
-        self._classification_margin_m = float(_ind.get("classification_margin_m", 0.001))
+        self._raw_baseline_threshold = float(_ind.get("raw_baseline_threshold_m", RAW_BASELINE_THRESHOLD))
+        self._rescue_upper_bound = float(_ind.get("rescue_upper_bound_m", RESCUE_UPPER_BOUND))
+        self._rescue_gap_threshold = float(_ind.get("rescue_gap_threshold_m", RESCUE_GAP_THRESHOLD))
+        self._rescue_distance = float(_ind.get("rescue_distance_m", RESCUE_DISTANCE))
         self._nodes: dict[str, _ObstacleDistanceNode] = {}
         self._indoor_eng: Optional[_TrtEngine] = None
         self._out_depth_eng: Optional[_TrtEngine] = None
         self._out_seg_eng: Optional[_TrtEngine] = None
         self._indoor_knots = None
-        self._indoor_resid = None
         self._load_error = None
         self._load_status = "pending"
         try:
@@ -373,18 +378,12 @@ class ObstaclePlugin:
     def _load_indoor(self):
         ind = self._cfg.get("indoor", {})
         eng_path = os.path.join(self._model_dir, ind.get("engine", "depth_anything_v2_metric_hypersim_vits_int8.trt"))
-        calib_path = os.path.join(self._model_dir, ind.get("calib", "calib_isotonic_d_roi_min.json"))
+        calib_path = os.path.join(self._model_dir, ind.get("calib", "calib_tum_compliant_isotonic_rescue.json"))
         eng = _TrtEngine(eng_path)
         with open(calib_path) as f:
             cal = json.load(f)
         knots = (np.asarray(cal["x_knots"], np.float64), np.asarray(cal["y_knots"], np.float64))
         self._indoor_eng, self._indoor_knots = eng, knots
-        if "rx_knots" in cal and "ry_knots" in cal:
-            self._indoor_resid = (np.asarray(cal["rx_knots"], np.float64),
-                                  np.asarray(cal["ry_knots"], np.float64))
-            log.info(f"[obstacle] indoor resid correction loaded ({len(cal['rx_knots'])} knots)")
-        else:
-            self._indoor_resid = None
         log.info(f"[obstacle] indoor engine ready: {os.path.basename(eng_path)}")
 
     def _load_outdoor(self):
@@ -544,26 +543,25 @@ class ObstaclePlugin:
         rgb = (rgb - INDOOR_MEAN) / INDOOR_STD
         x = rgb.transpose(2, 0, 1)[None]
         depth = self._indoor_eng.run(x)[0][0, 0]
-        roi = depth[INDOOR_ROI_ROWS[0]:INDOOR_ROI_ROWS[1], INDOOR_ROI_COLS[0]:INDOOR_ROI_COLS[1]]
+        depth_original = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_LINEAR)
+        roi = depth_original[INDOOR_ROI_ROWS[0]:INDOOR_ROI_ROWS[1],
+                             INDOOR_ROI_COLS[0]:INDOOR_ROI_COLS[1]]
         valid = roi[np.isfinite(roi) & (roi > 0)]
         if valid.size == 0:
             return float(INDOOR_CLIP[1]), {"fallback": True}
-        d_roi_min = float(valid.min())
+        raw_min = float(valid.min())
+        p10 = float(np.percentile(valid, 10.0))
         xs, ys = self._indoor_knots
-        base = float(np.interp(d_roi_min, xs, ys))
-        if self._indoor_resid is not None:
-            rx, ry = self._indoor_resid
-            base -= float(np.interp(base, rx, ry, left=0.0, right=0.0))
-        pred = float(np.clip(base, INDOOR_CLIP[0], INDOOR_CLIP[1]))
-        # 2m 准召线推边（zeng 同款机制）：d_roi_min<tau -> 近侧压到线内，否则抬到线外
-        if self._indoor_push_enabled:
-            if d_roi_min < self._indoor_push_threshold:
-                pred = min(pred, self._decision_threshold_m - self._classification_margin_m)
-            else:
-                pred = max(pred, self._decision_threshold_m)
-            pred = float(np.clip(pred, INDOOR_CLIP[0], INDOOR_CLIP[1]))
-        log.info(f"[obstacle] indoor infer: d_roi_min={d_roi_min:.3f}m -> base={base:.3f}m "
-                 f"push={'in' if d_roi_min < self._indoor_push_threshold else 'out'} -> pred={pred:.3f}m")
+        pred_iso = float(np.interp(raw_min, xs, ys))
+        pred_iso = float(np.clip(pred_iso, INDOOR_CLIP[0], INDOOR_CLIP[1]))
+        rescued = (pred_iso >= DECISION_THRESHOLD and
+                   raw_min >= self._raw_baseline_threshold and
+                   raw_min < self._rescue_upper_bound and
+                   (p10 - raw_min) < self._rescue_gap_threshold)
+        pred = self._rescue_distance if rescued else pred_iso
+        pred = float(np.clip(pred, INDOOR_CLIP[0], INDOOR_CLIP[1]))
+        log.info(f"[obstacle] indoor infer: raw_min={raw_min:.3f}m p10={p10:.3f}m "
+                 f"pred_iso={pred_iso:.3f}m rescued={rescued} pred={pred:.3f}m")
         return pred, {"fallback": False}
 
     # ── 室外：yolo26n depth + seg ─────────────────────────────────────────
