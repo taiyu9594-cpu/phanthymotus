@@ -37,8 +37,13 @@ plugins:
       depth_engine: yolo26n-depth_int8.trt
       seg_engine: yolo26n-seg_fp16.trt
       allowed_classes: [0, 1, 2, 3, 5, 7]
-      min_confidence: 0.25
-      percentile: 1.0      # 对齐 zeng pct1（近距更敏感），5 折扫描最优
+      min_confidence: 0.05
+      merged_near_percentile: 3.0
+      merged_guard_percentile: 10.0
+      instance_near_percentile: 1.0
+      boundary_low_m: 1.83
+      boundary_high_m: 2.0
+      support_threshold_ratio: 0.02
       min_depth_m: 0.3
       max_depth_m: 80.0
       offset_m: 1.0
