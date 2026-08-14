@@ -572,6 +572,7 @@ class ObstaclePlugin:
         merged_near_pct = float(cfg.get("merged_near_percentile", 3.0))
         merged_guard_pct = float(cfg.get("merged_guard_percentile", 10.0))
         instance_near_pct = float(cfg.get("instance_near_percentile", 1.0))
+        instance_distance_pct = float(cfg.get("instance_distance_percentile", 5.0))
         boundary_low = float(cfg.get("boundary_low_m", 1.83))
         boundary_high = float(cfg.get("boundary_high_m", 2.0))
         support_threshold = float(cfg.get("support_threshold_ratio", 0.02))
@@ -607,10 +608,14 @@ class ObstaclePlugin:
             if not inst_valid.any():
                 continue
             inst_vals = np.maximum(depth[inst_valid].astype(np.float32) - offset, 0.0)
-            raw_inst = float(np.percentile(inst_vals, instance_near_pct))
-            inst_pred = float(np.clip(scale * raw_inst + bias, 0, max_d))
+            raw_inst_p5 = float(np.percentile(inst_vals, instance_distance_pct))
+            raw_inst_p1 = float(np.percentile(inst_vals, instance_near_pct))
+            inst_pred_p5 = float(np.clip(scale * raw_inst_p5 + bias, 0, max_d))
+            inst_pred_p1 = float(np.clip(scale * raw_inst_p1 + bias, 0, max_d))
             area_ratio = float(mask.sum()) / float(h * w)
-            instance_predictions.append((inst_pred, area_ratio))
+            instance_predictions.append((inst_pred_p5, inst_pred_p1, area_ratio))
+        if not instance_predictions:
+            return fallback, {"fallback": True}
         valid = merged & np.isfinite(depth) & (depth >= min_d) & (depth <= max_d)
         if not valid.any():
             return fallback, {"fallback": True}
@@ -619,20 +624,22 @@ class ObstaclePlugin:
         raw_p10 = float(np.percentile(vals, merged_guard_pct))
         pred_p3 = float(np.clip(scale * raw_p3 + bias, 0, max_d))
         pred_p10 = float(np.clip(scale * raw_p10 + bias, 0, max_d))
+        min_inst_p5 = min(inst_pred_p5 for inst_pred_p5, _, _ in instance_predictions)
         boundary_switch = (boundary_low <= pred_p3 < boundary_high and
-                           pred_p10 >= boundary_high)
-        pred = pred_p10 if boundary_switch else pred_p3
+                           pred_p10 >= boundary_high and
+                           min_inst_p5 < boundary_high)
+        pred = max(min_inst_p5, pred_p10) if boundary_switch else min_inst_p5
 
         support_switch = False
         fallback_used = False
         if pred < boundary_high:
             near_instances = [record for record in instance_predictions
-                              if record[0] < boundary_high]
+                              if record[1] < boundary_high]
             if (near_instances and
                     all(area_ratio < support_threshold
-                        for _, area_ratio in near_instances)):
-                remaining = [inst_pred for inst_pred, _ in instance_predictions
-                             if inst_pred >= boundary_high]
+                        for _, _, area_ratio in near_instances)):
+                remaining = [inst_pred_p5 for inst_pred_p5, inst_pred_p1, _
+                             in instance_predictions if inst_pred_p1 >= boundary_high]
                 if remaining:
                     pred = min(remaining)
                 else:
@@ -641,7 +648,8 @@ class ObstaclePlugin:
                 support_switch = True
 
         log.info(f"[obstacle] outdoor infer: det={len(inst)} selected={len(sel)} "
-                 f"P3={pred_p3:.3f}m P10={pred_p10:.3f}m "
+                 f"min_inst_P5={min_inst_p5:.3f}m merged_P3={pred_p3:.3f}m "
+                 f"merged_P10={pred_p10:.3f}m "
                  f"boundary_switch={boundary_switch} support_switch={support_switch} "
                  f"pred={pred:.3f}m")
         return pred, {"fallback": fallback_used}

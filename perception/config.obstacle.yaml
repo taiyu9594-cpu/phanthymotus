@@ -44,6 +44,7 @@ plugins:
       merged_near_percentile: 3.0
       merged_guard_percentile: 10.0
       instance_near_percentile: 1.0
+      instance_distance_percentile: 5.0
       boundary_low_m: 1.83
       boundary_high_m: 2.0
       support_threshold_ratio: 0.02
