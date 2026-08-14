@@ -48,6 +48,7 @@ plugins:
       boundary_low_m: 1.83
       boundary_high_m: 2.0
       support_threshold_ratio: 0.02
+      front_near_guard: true
       min_depth_m: 0.3
       max_depth_m: 80.0
       offset_m: 1.0

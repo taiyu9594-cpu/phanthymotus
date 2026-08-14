@@ -576,6 +576,7 @@ class ObstaclePlugin:
         boundary_low = float(cfg.get("boundary_low_m", 1.83))
         boundary_high = float(cfg.get("boundary_high_m", 2.0))
         support_threshold = float(cfg.get("support_threshold_ratio", 0.02))
+        front_near_guard = bool(cfg.get("front_near_guard", True))
         min_d = float(cfg.get("min_depth_m", 0.3))
         max_d = float(cfg.get("max_depth_m", 80.0))
         offset = float(cfg.get("offset_m", 1.0))
@@ -612,8 +613,15 @@ class ObstaclePlugin:
             raw_inst_p1 = float(np.percentile(inst_vals, instance_near_pct))
             inst_pred_p5 = float(np.clip(scale * raw_inst_p5 + bias, 0, max_d))
             inst_pred_p1 = float(np.clip(scale * raw_inst_p1 + bias, 0, max_d))
-            area_ratio = float(mask.sum()) / float(h * w)
-            instance_predictions.append((inst_pred_p5, inst_pred_p1, area_ratio))
+            mask_pixels = int(mask.sum())
+            area_ratio = float(mask_pixels) / float(h * w)
+            x_start = int(0.25 * w)
+            x_end = int(0.75 * w)
+            central_overlap_pixels = int(np.count_nonzero(mask[:, x_start:x_end]))
+            central_overlap_ratio = float(central_overlap_pixels) / float(mask_pixels)
+            has_front_overlap = central_overlap_pixels > 0
+            instance_predictions.append((inst_pred_p5, inst_pred_p1, area_ratio,
+                                         central_overlap_ratio, has_front_overlap))
         if not instance_predictions:
             return fallback, {"fallback": True}
         valid = merged & np.isfinite(depth) & (depth >= min_d) & (depth <= max_d)
@@ -624,7 +632,19 @@ class ObstaclePlugin:
         raw_p10 = float(np.percentile(vals, merged_guard_pct))
         pred_p3 = float(np.clip(scale * raw_p3 + bias, 0, max_d))
         pred_p10 = float(np.clip(scale * raw_p10 + bias, 0, max_d))
-        min_inst_p5 = min(inst_pred_p5 for inst_pred_p5, _, _ in instance_predictions)
+        if front_near_guard:
+            filtered_instances = [record for record in instance_predictions
+                                  if record[0] >= boundary_high or record[4]]
+        else:
+            filtered_instances = instance_predictions
+        front_reject_count = len(instance_predictions) - len(filtered_instances)
+        if not filtered_instances:
+            log.info(f"[obstacle] outdoor infer: det={len(inst)} selected={len(sel)} "
+                     f"front_reject_count={front_reject_count} min_inst_P5=none "
+                     f"merged_P3={pred_p3:.3f}m merged_P10={pred_p10:.3f}m "
+                     f"boundary_switch=False support_switch=False pred={fallback:.3f}m")
+            return fallback, {"fallback": True}
+        min_inst_p5 = min(record[0] for record in filtered_instances)
         boundary_switch = (boundary_low <= pred_p3 < boundary_high and
                            pred_p10 >= boundary_high and
                            min_inst_p5 < boundary_high)
@@ -633,13 +653,13 @@ class ObstaclePlugin:
         support_switch = False
         fallback_used = False
         if pred < boundary_high:
-            near_instances = [record for record in instance_predictions
+            near_instances = [record for record in filtered_instances
                               if record[1] < boundary_high]
             if (near_instances and
                     all(area_ratio < support_threshold
-                        for _, _, area_ratio in near_instances)):
-                remaining = [inst_pred_p5 for inst_pred_p5, inst_pred_p1, _
-                             in instance_predictions if inst_pred_p1 >= boundary_high]
+                        for _, _, area_ratio, _, _ in near_instances)):
+                remaining = [record[0] for record in filtered_instances
+                             if record[1] >= boundary_high]
                 if remaining:
                     pred = min(remaining)
                 else:
@@ -648,6 +668,7 @@ class ObstaclePlugin:
                 support_switch = True
 
         log.info(f"[obstacle] outdoor infer: det={len(inst)} selected={len(sel)} "
+                 f"front_reject_count={front_reject_count} "
                  f"min_inst_P5={min_inst_p5:.3f}m merged_P3={pred_p3:.3f}m "
                  f"merged_P10={pred_p10:.3f}m "
                  f"boundary_switch={boundary_switch} support_switch={support_switch} "
