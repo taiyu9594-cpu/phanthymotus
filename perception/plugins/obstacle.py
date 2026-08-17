@@ -84,6 +84,7 @@ DECISION_THRESHOLD = 2.0
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
 MASK_CONF_FLOOR = 0.05
+OUTDOOR_ALGO_VERSION = "v6-candidate-diagnostic"
 
 
 class _TrtEngine:
@@ -594,11 +595,49 @@ class ObstaclePlugin:
         # 分割：letterbox 640 -> engine -> 掩码（allowed 类）
         lb_s, r_s, dw_s, dh_s = _letterbox(bgr, 640)
         det, proto = self._out_seg_eng.run(lb_s[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0)
+        raw_detections = np.asarray(det[0])
+        raw_conf05 = raw_detections[:, 4] >= MASK_CONF_FLOOR
+        raw_conf05_count = int(np.count_nonzero(raw_conf05))
+        raw_class_ids = raw_detections[raw_conf05, 5].astype(np.int64)
+        allowed_conf05 = np.isin(raw_class_ids, tuple(allowed))
+        allowed_conf05_count = int(np.count_nonzero(allowed_conf05))
+        raw_classes, raw_counts = np.unique(raw_class_ids, return_counts=True)
+        rejected_classes, rejected_counts = np.unique(
+            raw_class_ids[~allowed_conf05], return_counts=True
+        )
+        raw_class_hist = "{" + ",".join(
+            f"{class_id}:{count}" for class_id, count in zip(raw_classes, raw_counts)
+        ) + "}"
+        rejected_class_hist = "{" + ",".join(
+            f"{class_id}:{count}"
+            for class_id, count in zip(rejected_classes, rejected_counts)
+        ) + "}"
         inst = self._process_masks(det[0], proto[0], h, w, r_s, dw_s, dh_s, allowed)
+        valid_mask_count = len(inst)
         if not inst:
+            if raw_conf05_count == 0:
+                fallback_reason = "no_raw_detection"
+            elif allowed_conf05_count == 0:
+                fallback_reason = "no_allowed_detection"
+            else:
+                fallback_reason = "no_valid_mask"
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"raw_conf05_count={raw_conf05_count} "
+                     f"allowed_conf05_count={allowed_conf05_count} "
+                     f"valid_mask_count={valid_mask_count} "
+                     f"raw_class_hist={raw_class_hist} "
+                     f"rejected_class_hist={rejected_class_hist} "
+                     f"fallback_reason={fallback_reason} pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         sel = np.where(np.array([c for _, c, _ in inst]) >= min_conf)[0]
         if sel.size == 0:
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected=0 raw_conf05_count={raw_conf05_count} "
+                     f"allowed_conf05_count={allowed_conf05_count} "
+                     f"valid_mask_count={valid_mask_count} "
+                     f"raw_class_hist={raw_class_hist} "
+                     f"rejected_class_hist={rejected_class_hist} "
+                     f"fallback_reason=no_detection pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         merged = np.zeros(depth.shape, bool)
         instance_predictions = []
@@ -623,9 +662,21 @@ class ObstaclePlugin:
             instance_predictions.append((inst_pred_p5, inst_pred_p1, area_ratio,
                                          central_overlap_ratio, has_front_overlap))
         if not instance_predictions:
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected={len(sel)} "
+                     f"raw_conf05_count={raw_conf05_count} "
+                     f"allowed_conf05_count={allowed_conf05_count} "
+                     f"valid_mask_count={valid_mask_count} "
+                     f"fallback_reason=no_valid_instance_depth pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         valid = merged & np.isfinite(depth) & (depth >= min_d) & (depth <= max_d)
         if not valid.any():
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected={len(sel)} "
+                     f"raw_conf05_count={raw_conf05_count} "
+                     f"allowed_conf05_count={allowed_conf05_count} "
+                     f"valid_mask_count={valid_mask_count} "
+                     f"fallback_reason=no_valid_merged_depth pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         vals = np.maximum(depth[valid].astype(np.float32) - offset, 0.0)
         raw_p3 = float(np.percentile(vals, merged_near_pct))
@@ -639,10 +690,15 @@ class ObstaclePlugin:
             filtered_instances = instance_predictions
         front_reject_count = len(instance_predictions) - len(filtered_instances)
         if not filtered_instances:
-            log.info(f"[obstacle] outdoor infer: det={len(inst)} selected={len(sel)} "
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected={len(sel)} "
+                     f"raw_conf05_count={raw_conf05_count} "
+                     f"allowed_conf05_count={allowed_conf05_count} "
+                     f"valid_mask_count={valid_mask_count} "
                      f"front_reject_count={front_reject_count} min_inst_P5=none "
                      f"merged_P3={pred_p3:.3f}m merged_P10={pred_p10:.3f}m "
-                     f"boundary_switch=False support_switch=False pred={fallback:.3f}m")
+                     f"boundary_switch=False support_switch=False "
+                     f"fallback_reason=front_guard_empty pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         min_inst_p5 = min(record[0] for record in filtered_instances)
         boundary_switch = (boundary_low <= pred_p3 < boundary_high and
@@ -667,11 +723,19 @@ class ObstaclePlugin:
                     fallback_used = True
                 support_switch = True
 
-        log.info(f"[obstacle] outdoor infer: det={len(inst)} selected={len(sel)} "
+        fallback_reason = "support_no_remaining" if fallback_used else "none"
+        log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                 f"det={len(inst)} selected={len(sel)} "
+                 f"raw_conf05_count={raw_conf05_count} "
+                 f"allowed_conf05_count={allowed_conf05_count} "
+                 f"valid_mask_count={valid_mask_count} "
+                 f"raw_class_hist={raw_class_hist} "
+                 f"rejected_class_hist={rejected_class_hist} "
                  f"front_reject_count={front_reject_count} "
                  f"min_inst_P5={min_inst_p5:.3f}m merged_P3={pred_p3:.3f}m "
                  f"merged_P10={pred_p10:.3f}m "
                  f"boundary_switch={boundary_switch} support_switch={support_switch} "
+                 f"fallback_reason={fallback_reason} "
                  f"pred={pred:.3f}m")
         return pred, {"fallback": fallback_used}
 
