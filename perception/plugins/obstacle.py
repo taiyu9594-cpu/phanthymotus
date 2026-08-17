@@ -84,7 +84,7 @@ DECISION_THRESHOLD = 2.0
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
 MASK_CONF_FLOOR = 0.05
-OUTDOOR_ALGO_VERSION = "v6-candidate-diagnostic"
+OUTDOOR_ALGO_VERSION = "v7-engine-rejected-diagnostic"
 
 
 class _TrtEngine:
@@ -596,6 +596,24 @@ class ObstaclePlugin:
         lb_s, r_s, dw_s, dh_s = _letterbox(bgr, 640)
         det, proto = self._out_seg_eng.run(lb_s[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0)
         raw_detections = np.asarray(det[0])
+        valid_engine_row = ((raw_detections[:, 4] > 0) &
+                            (raw_detections[:, 2] > raw_detections[:, 0]) &
+                            (raw_detections[:, 3] > raw_detections[:, 1]))
+        engine_detections = raw_detections[valid_engine_row]
+        engine_det_count = len(engine_detections)
+        engine_below05_count = int(np.count_nonzero(
+            engine_detections[:, 4] < MASK_CONF_FLOOR
+        ))
+        if engine_det_count:
+            engine_max_conf = f"{float(np.max(engine_detections[:, 4])):.3f}"
+            engine_order = np.argsort(-engine_detections[:, 4], kind="stable")[:3]
+            engine_top3 = "[" + ",".join(
+                f"({int(engine_detections[j, 5])},{float(engine_detections[j, 4]):.3f})"
+                for j in engine_order
+            ) + "]"
+        else:
+            engine_max_conf = "none"
+            engine_top3 = "[]"
         raw_conf05 = raw_detections[:, 4] >= MASK_CONF_FLOOR
         raw_conf05_count = int(np.count_nonzero(raw_conf05))
         raw_class_ids = raw_detections[raw_conf05, 5].astype(np.int64)
@@ -614,6 +632,66 @@ class ObstaclePlugin:
         ) + "}"
         inst = self._process_masks(det[0], proto[0], h, w, r_s, dw_s, dh_s, allowed)
         valid_mask_count = len(inst)
+        rejected_inst = self._process_rejected_masks(
+            det[0], proto[0], h, w, r_s, dw_s, dh_s, allowed
+        )
+        rejected_mask_count = len(rejected_inst)
+        rejected_predictions = []
+        for class_id, confidence, mask in rejected_inst:
+            rejected_valid = (mask & np.isfinite(depth) &
+                              (depth >= min_d) & (depth <= max_d))
+            if not rejected_valid.any():
+                continue
+            rejected_vals = np.maximum(
+                depth[rejected_valid].astype(np.float32) - offset, 0.0
+            )
+            raw_rejected_p5 = float(np.percentile(
+                rejected_vals, instance_distance_pct
+            ))
+            rejected_pred_p5 = float(np.clip(
+                scale * raw_rejected_p5 + bias, 0, max_d
+            ))
+            mask_pixels = int(mask.sum())
+            x_start = int(0.25 * w)
+            x_end = int(0.75 * w)
+            central_overlap_pixels = int(np.count_nonzero(mask[:, x_start:x_end]))
+            rejected_overlap = float(central_overlap_pixels) / float(mask_pixels)
+            rejected_predictions.append((rejected_pred_p5, class_id, confidence,
+                                         rejected_overlap))
+        rejected_predictions.sort(key=lambda record: record[0])
+        rejected_valid_depth_count = len(rejected_predictions)
+        if rejected_predictions:
+            nearest_rejected = rejected_predictions[0]
+            nearest_rejected_class = str(nearest_rejected[1])
+            nearest_rejected_conf = f"{nearest_rejected[2]:.3f}"
+            nearest_rejected_p5 = f"{nearest_rejected[0]:.3f}m"
+            nearest_rejected_overlap = f"{nearest_rejected[3]:.5f}"
+            rejected_top3 = "[" + ",".join(
+                f"({record[1]},{record[2]:.3f},{record[0]:.3f},{record[3]:.5f})"
+                for record in rejected_predictions[:3]
+            ) + "]"
+        else:
+            nearest_rejected_class = "none"
+            nearest_rejected_conf = "none"
+            nearest_rejected_p5 = "none"
+            nearest_rejected_overlap = "none"
+            rejected_top3 = "[]"
+        engine_diag = (f"engine_det_count={engine_det_count} "
+                       f"engine_below05_count={engine_below05_count} "
+                       f"engine_max_conf={engine_max_conf} "
+                       f"engine_top3={engine_top3}")
+        coverage_diag = (f"raw_conf05_count={raw_conf05_count} "
+                         f"allowed_conf05_count={allowed_conf05_count} "
+                         f"valid_mask_count={valid_mask_count}")
+        class_diag = (f"raw_class_hist={raw_class_hist} "
+                      f"rejected_class_hist={rejected_class_hist}")
+        rejected_diag = (f"rejected_mask_count={rejected_mask_count} "
+                         f"rejected_valid_depth_count={rejected_valid_depth_count} "
+                         f"nearest_rejected_class={nearest_rejected_class} "
+                         f"nearest_rejected_conf={nearest_rejected_conf} "
+                         f"nearest_rejected_P5={nearest_rejected_p5} "
+                         f"nearest_rejected_overlap={nearest_rejected_overlap} "
+                         f"rejected_top3={rejected_top3}")
         if not inst:
             if raw_conf05_count == 0:
                 fallback_reason = "no_raw_detection"
@@ -622,21 +700,14 @@ class ObstaclePlugin:
             else:
                 fallback_reason = "no_valid_mask"
             log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
-                     f"raw_conf05_count={raw_conf05_count} "
-                     f"allowed_conf05_count={allowed_conf05_count} "
-                     f"valid_mask_count={valid_mask_count} "
-                     f"raw_class_hist={raw_class_hist} "
-                     f"rejected_class_hist={rejected_class_hist} "
+                     f"{engine_diag} {coverage_diag} {class_diag} {rejected_diag} "
                      f"fallback_reason={fallback_reason} pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         sel = np.where(np.array([c for _, c, _ in inst]) >= min_conf)[0]
         if sel.size == 0:
             log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
-                     f"det={len(inst)} selected=0 raw_conf05_count={raw_conf05_count} "
-                     f"allowed_conf05_count={allowed_conf05_count} "
-                     f"valid_mask_count={valid_mask_count} "
-                     f"raw_class_hist={raw_class_hist} "
-                     f"rejected_class_hist={rejected_class_hist} "
+                     f"det={len(inst)} selected=0 {engine_diag} {coverage_diag} "
+                     f"{class_diag} {rejected_diag} "
                      f"fallback_reason=no_detection pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         merged = np.zeros(depth.shape, bool)
@@ -664,18 +735,14 @@ class ObstaclePlugin:
         if not instance_predictions:
             log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
                      f"det={len(inst)} selected={len(sel)} "
-                     f"raw_conf05_count={raw_conf05_count} "
-                     f"allowed_conf05_count={allowed_conf05_count} "
-                     f"valid_mask_count={valid_mask_count} "
+                     f"{engine_diag} {coverage_diag} {class_diag} {rejected_diag} "
                      f"fallback_reason=no_valid_instance_depth pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         valid = merged & np.isfinite(depth) & (depth >= min_d) & (depth <= max_d)
         if not valid.any():
             log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
                      f"det={len(inst)} selected={len(sel)} "
-                     f"raw_conf05_count={raw_conf05_count} "
-                     f"allowed_conf05_count={allowed_conf05_count} "
-                     f"valid_mask_count={valid_mask_count} "
+                     f"{engine_diag} {coverage_diag} {class_diag} {rejected_diag} "
                      f"fallback_reason=no_valid_merged_depth pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         vals = np.maximum(depth[valid].astype(np.float32) - offset, 0.0)
@@ -692,9 +759,7 @@ class ObstaclePlugin:
         if not filtered_instances:
             log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
                      f"det={len(inst)} selected={len(sel)} "
-                     f"raw_conf05_count={raw_conf05_count} "
-                     f"allowed_conf05_count={allowed_conf05_count} "
-                     f"valid_mask_count={valid_mask_count} "
+                     f"{engine_diag} {coverage_diag} {class_diag} {rejected_diag} "
                      f"front_reject_count={front_reject_count} min_inst_P5=none "
                      f"merged_P3={pred_p3:.3f}m merged_P10={pred_p10:.3f}m "
                      f"boundary_switch=False support_switch=False "
@@ -726,11 +791,7 @@ class ObstaclePlugin:
         fallback_reason = "support_no_remaining" if fallback_used else "none"
         log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
                  f"det={len(inst)} selected={len(sel)} "
-                 f"raw_conf05_count={raw_conf05_count} "
-                 f"allowed_conf05_count={allowed_conf05_count} "
-                 f"valid_mask_count={valid_mask_count} "
-                 f"raw_class_hist={raw_class_hist} "
-                 f"rejected_class_hist={rejected_class_hist} "
+                 f"{engine_diag} {coverage_diag} {class_diag} {rejected_diag} "
                  f"front_reject_count={front_reject_count} "
                  f"min_inst_P5={min_inst_p5:.3f}m merged_P3={pred_p3:.3f}m "
                  f"merged_P10={pred_p10:.3f}m "
@@ -768,6 +829,41 @@ class ObstaclePlugin:
                 continue
             mask = mask[dh:dh + unpad_h, dw:dw + unpad_w]
             mask = cv2.resize(mask.astype(np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST).astype(bool)
+            results.append((int(det[5]), float(det[4]), mask))
+        return results
+
+    @staticmethod
+    def _process_rejected_masks(detections, prototypes, oh, ow, ratio, dw, dh,
+                                allowed):
+        """Decode diagnostic-only masks rejected by the production class allowlist."""
+        detections = np.asarray(detections, dtype=np.float32)
+        prototypes = np.asarray(prototypes, dtype=np.float32)
+        sel = detections[:, 4] >= MASK_CONF_FLOOR
+        sel &= ~np.isin(detections[:, 5].astype(np.int64), tuple(allowed))
+        selected = detections[sel]
+        if not len(selected):
+            return []
+        channels, mh, mw = prototypes.shape
+        coeffs = selected[:, 6:6 + channels]
+        logits = (coeffs @ prototypes.reshape(channels, -1)).reshape(-1, mh, mw)
+        unpad_h = min(int(round(oh * ratio)), 640 - dh)
+        unpad_w = min(int(round(ow * ratio)), 640 - dw)
+        rows = np.arange(640, dtype=np.float32)[:, None]
+        cols = np.arange(640, dtype=np.float32)[None, :]
+        results = []
+        for det, logit in zip(selected, logits):
+            up = cv2.resize(logit, (640, 640), interpolation=cv2.INTER_LINEAR)
+            x1, y1, x2, y2 = det[0], det[1], det[2], det[3]
+            mask = up > 0.0
+            mask &= cols >= x1
+            mask &= cols < x2
+            mask &= rows >= y1
+            mask &= rows < y2
+            if not mask.any():
+                continue
+            mask = mask[dh:dh + unpad_h, dw:dw + unpad_w]
+            mask = cv2.resize(mask.astype(np.uint8), (ow, oh),
+                              interpolation=cv2.INTER_NEAREST).astype(bool)
             results.append((int(det[5]), float(det[4]), mask))
         return results
 
