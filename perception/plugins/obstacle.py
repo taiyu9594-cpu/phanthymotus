@@ -84,6 +84,7 @@ DECISION_THRESHOLD = 2.0
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
 MASK_CONF_FLOOR = 0.05
+OUTDOOR_ALGO_VERSION = "v5-diagnostic"
 
 
 class _TrtEngine:
@@ -596,9 +597,14 @@ class ObstaclePlugin:
         det, proto = self._out_seg_eng.run(lb_s[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0)
         inst = self._process_masks(det[0], proto[0], h, w, r_s, dw_s, dh_s, allowed)
         if not inst:
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"fallback_reason=no_selected_mask pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         sel = np.where(np.array([c for _, c, _ in inst]) >= min_conf)[0]
         if sel.size == 0:
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected=0 fallback_reason=no_detection "
+                     f"pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         merged = np.zeros(depth.shape, bool)
         instance_predictions = []
@@ -611,8 +617,12 @@ class ObstaclePlugin:
             inst_vals = np.maximum(depth[inst_valid].astype(np.float32) - offset, 0.0)
             raw_inst_p5 = float(np.percentile(inst_vals, instance_distance_pct))
             raw_inst_p1 = float(np.percentile(inst_vals, instance_near_pct))
+            raw_inst_p3 = float(np.percentile(inst_vals, 3.0))
+            raw_inst_p10 = float(np.percentile(inst_vals, 10.0))
             inst_pred_p5 = float(np.clip(scale * raw_inst_p5 + bias, 0, max_d))
             inst_pred_p1 = float(np.clip(scale * raw_inst_p1 + bias, 0, max_d))
+            inst_pred_p3 = float(np.clip(scale * raw_inst_p3 + bias, 0, max_d))
+            inst_pred_p10 = float(np.clip(scale * raw_inst_p10 + bias, 0, max_d))
             mask_pixels = int(mask.sum())
             area_ratio = float(mask_pixels) / float(h * w)
             x_start = int(0.25 * w)
@@ -621,11 +631,19 @@ class ObstaclePlugin:
             central_overlap_ratio = float(central_overlap_pixels) / float(mask_pixels)
             has_front_overlap = central_overlap_pixels > 0
             instance_predictions.append((inst_pred_p5, inst_pred_p1, area_ratio,
-                                         central_overlap_ratio, has_front_overlap))
+                                         central_overlap_ratio, has_front_overlap,
+                                         inst_pred_p3, inst_pred_p10,
+                                         inst[j][0], inst[j][1]))
         if not instance_predictions:
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected={len(sel)} "
+                     f"fallback_reason=no_valid_instance_depth pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         valid = merged & np.isfinite(depth) & (depth >= min_d) & (depth <= max_d)
         if not valid.any():
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected={len(sel)} "
+                     f"fallback_reason=no_valid_merged_depth pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         vals = np.maximum(depth[valid].astype(np.float32) - offset, 0.0)
         raw_p3 = float(np.percentile(vals, merged_near_pct))
@@ -639,10 +657,15 @@ class ObstaclePlugin:
             filtered_instances = instance_predictions
         front_reject_count = len(instance_predictions) - len(filtered_instances)
         if not filtered_instances:
-            log.info(f"[obstacle] outdoor infer: det={len(inst)} selected={len(sel)} "
+            log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                     f"det={len(inst)} selected={len(sel)} "
                      f"front_reject_count={front_reject_count} min_inst_P5=none "
                      f"merged_P3={pred_p3:.3f}m merged_P10={pred_p10:.3f}m "
-                     f"boundary_switch=False support_switch=False pred={fallback:.3f}m")
+                     f"nearest_P1=none nearest_P3=none nearest_P5=none nearest_P10=none "
+                     f"nearest_class=none nearest_conf=none nearest_area=none "
+                     f"nearest_overlap=none top3=[] boundary_switch=False "
+                     f"support_switch=False fallback_reason=front_guard_empty "
+                     f"pred={fallback:.3f}m")
             return fallback, {"fallback": True}
         min_inst_p5 = min(record[0] for record in filtered_instances)
         boundary_switch = (boundary_low <= pred_p3 < boundary_high and
@@ -657,7 +680,7 @@ class ObstaclePlugin:
                               if record[1] < boundary_high]
             if (near_instances and
                     all(area_ratio < support_threshold
-                        for _, _, area_ratio, _, _ in near_instances)):
+                        for _, _, area_ratio, *_ in near_instances)):
                 remaining = [record[0] for record in filtered_instances
                              if record[1] >= boundary_high]
                 if remaining:
@@ -667,11 +690,26 @@ class ObstaclePlugin:
                     fallback_used = True
                 support_switch = True
 
-        log.info(f"[obstacle] outdoor infer: det={len(inst)} selected={len(sel)} "
+        sorted_instances = sorted(filtered_instances, key=lambda record: record[0])
+        nearest = sorted_instances[0]
+        top3 = "[" + ",".join(
+            f"({record[7]},{record[8]:.3f},{record[1]:.3f},{record[5]:.3f},"
+            f"{record[0]:.3f},{record[6]:.3f},{record[2]:.5f},{record[3]:.5f})"
+            for record in sorted_instances[:3]
+        ) + "]"
+        fallback_reason = "support_no_remaining" if fallback_used else "none"
+        log.info(f"[obstacle] outdoor infer: algo={OUTDOOR_ALGO_VERSION} "
+                 f"det={len(inst)} selected={len(sel)} "
                  f"front_reject_count={front_reject_count} "
                  f"min_inst_P5={min_inst_p5:.3f}m merged_P3={pred_p3:.3f}m "
                  f"merged_P10={pred_p10:.3f}m "
+                 f"nearest_P1={nearest[1]:.3f}m nearest_P3={nearest[5]:.3f}m "
+                 f"nearest_P5={nearest[0]:.3f}m nearest_P10={nearest[6]:.3f}m "
+                 f"nearest_class={nearest[7]} nearest_conf={nearest[8]:.3f} "
+                 f"nearest_area={nearest[2]:.5f} nearest_overlap={nearest[3]:.5f} "
+                 f"top3={top3} "
                  f"boundary_switch={boundary_switch} support_switch={support_switch} "
+                 f"fallback_reason={fallback_reason} "
                  f"pred={pred:.3f}m")
         return pred, {"fallback": fallback_used}
 
