@@ -84,7 +84,8 @@ DECISION_THRESHOLD = 2.0
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
 MASK_CONF_FLOOR = 0.05
-OUTDOOR_ALGO_VERSION = "v7-engine-rejected-diagnostic"
+MAX_REJECTED_DIAGNOSTIC = 3
+OUTDOOR_ALGO_VERSION = "v7.1-light-diagnostic"
 
 
 class _TrtEngine:
@@ -632,32 +633,12 @@ class ObstaclePlugin:
         ) + "}"
         inst = self._process_masks(det[0], proto[0], h, w, r_s, dw_s, dh_s, allowed)
         valid_mask_count = len(inst)
-        rejected_inst = self._process_rejected_masks(
-            det[0], proto[0], h, w, r_s, dw_s, dh_s, allowed
-        )
-        rejected_mask_count = len(rejected_inst)
-        rejected_predictions = []
-        for class_id, confidence, mask in rejected_inst:
-            rejected_valid = (mask & np.isfinite(depth) &
-                              (depth >= min_d) & (depth <= max_d))
-            if not rejected_valid.any():
-                continue
-            rejected_vals = np.maximum(
-                depth[rejected_valid].astype(np.float32) - offset, 0.0
-            )
-            raw_rejected_p5 = float(np.percentile(
-                rejected_vals, instance_distance_pct
-            ))
-            rejected_pred_p5 = float(np.clip(
-                scale * raw_rejected_p5 + bias, 0, max_d
-            ))
-            mask_pixels = int(mask.sum())
-            x_start = int(0.25 * w)
-            x_end = int(0.75 * w)
-            central_overlap_pixels = int(np.count_nonzero(mask[:, x_start:x_end]))
-            rejected_overlap = float(central_overlap_pixels) / float(mask_pixels)
-            rejected_predictions.append((rejected_pred_p5, class_id, confidence,
-                                         rejected_overlap))
+        (rejected_total_conf05_count,
+         rejected_mask_count,
+         rejected_predictions) = self._process_rejected_diagnostics(
+             det[0], proto[0], depth, h, w, r_s, dw_s, dh_s, allowed,
+             min_d, max_d, offset, scale, bias, instance_distance_pct
+         )
         rejected_predictions.sort(key=lambda record: record[0])
         rejected_valid_depth_count = len(rejected_predictions)
         if rejected_predictions:
@@ -685,7 +666,8 @@ class ObstaclePlugin:
                          f"valid_mask_count={valid_mask_count}")
         class_diag = (f"raw_class_hist={raw_class_hist} "
                       f"rejected_class_hist={rejected_class_hist}")
-        rejected_diag = (f"rejected_mask_count={rejected_mask_count} "
+        rejected_diag = (f"rejected_total_conf05_count={rejected_total_conf05_count} "
+                         f"rejected_mask_count={rejected_mask_count} "
                          f"rejected_valid_depth_count={rejected_valid_depth_count} "
                          f"nearest_rejected_class={nearest_rejected_class} "
                          f"nearest_rejected_conf={nearest_rejected_conf} "
@@ -833,28 +815,39 @@ class ObstaclePlugin:
         return results
 
     @staticmethod
-    def _process_rejected_masks(detections, prototypes, oh, ow, ratio, dw, dh,
-                                allowed):
-        """Decode diagnostic-only masks rejected by the production class allowlist."""
+    def _process_rejected_diagnostics(detections, prototypes, depth, oh, ow,
+                                      ratio, dw, dh, allowed, min_d, max_d,
+                                      offset, scale, bias, distance_pct):
+        """Decode at most three rejected masks, retaining only numeric diagnostics."""
         detections = np.asarray(detections, dtype=np.float32)
         prototypes = np.asarray(prototypes, dtype=np.float32)
         sel = detections[:, 4] >= MASK_CONF_FLOOR
         sel &= ~np.isin(detections[:, 5].astype(np.int64), tuple(allowed))
-        selected = detections[sel]
-        if not len(selected):
-            return []
+        rejected_indices = np.flatnonzero(sel)
+        rejected_total_conf05_count = len(rejected_indices)
+        if not rejected_total_conf05_count:
+            return 0, 0, []
+        confidence_order = np.argsort(
+            -detections[rejected_indices, 4], kind="stable"
+        )
+        diagnostic_indices = rejected_indices[
+            confidence_order[:MAX_REJECTED_DIAGNOSTIC]
+        ]
         channels, mh, mw = prototypes.shape
-        coeffs = selected[:, 6:6 + channels]
-        logits = (coeffs @ prototypes.reshape(channels, -1)).reshape(-1, mh, mw)
+        flat_prototypes = prototypes.reshape(channels, -1)
         unpad_h = min(int(round(oh * ratio)), 640 - dh)
         unpad_w = min(int(round(ow * ratio)), 640 - dw)
         rows = np.arange(640, dtype=np.float32)[:, None]
         cols = np.arange(640, dtype=np.float32)[None, :]
-        results = []
-        for det, logit in zip(selected, logits):
-            up = cv2.resize(logit, (640, 640), interpolation=cv2.INTER_LINEAR)
+        rejected_mask_count = 0
+        numeric_results = []
+        for detection_index in diagnostic_indices:
+            det = detections[detection_index]
+            logit = (det[6:6 + channels] @ flat_prototypes).reshape(mh, mw)
             x1, y1, x2, y2 = det[0], det[1], det[2], det[3]
-            mask = up > 0.0
+            mask = cv2.resize(
+                logit, (640, 640), interpolation=cv2.INTER_LINEAR
+            ) > 0.0
             mask &= cols >= x1
             mask &= cols < x2
             mask &= rows >= y1
@@ -864,8 +857,31 @@ class ObstaclePlugin:
             mask = mask[dh:dh + unpad_h, dw:dw + unpad_w]
             mask = cv2.resize(mask.astype(np.uint8), (ow, oh),
                               interpolation=cv2.INTER_NEAREST).astype(bool)
-            results.append((int(det[5]), float(det[4]), mask))
-        return results
+            rejected_mask_count += 1
+            mask_pixels = int(mask.sum())
+            if not mask_pixels:
+                continue
+            depth_values = depth[mask]
+            valid_depth_values = depth_values[
+                np.isfinite(depth_values) &
+                (depth_values >= min_d) & (depth_values <= max_d)
+            ]
+            if not valid_depth_values.size:
+                continue
+            rejected_values = np.maximum(
+                valid_depth_values.astype(np.float32) - offset, 0.0
+            )
+            raw_rejected_p5 = float(np.percentile(rejected_values, distance_pct))
+            rejected_pred_p5 = float(np.clip(
+                scale * raw_rejected_p5 + bias, 0, max_d
+            ))
+            x_start = int(0.25 * ow)
+            x_end = int(0.75 * ow)
+            central_overlap_pixels = int(np.count_nonzero(mask[:, x_start:x_end]))
+            rejected_overlap = float(central_overlap_pixels) / float(mask_pixels)
+            numeric_results.append((rejected_pred_p5, int(det[5]),
+                                    float(det[4]), rejected_overlap))
+        return rejected_total_conf05_count, rejected_mask_count, numeric_results
 
 
 def build_plugin(cfg: dict, executor) -> ObstaclePlugin:
