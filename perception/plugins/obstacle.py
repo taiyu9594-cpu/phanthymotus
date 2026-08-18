@@ -84,6 +84,10 @@ DECISION_THRESHOLD = 2.0
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
 MASK_CONF_FLOOR = 0.05
+LOW_CONF_RESCUE_MIN = 0.015
+LOW_CONF_RESCUE_MAX_CANDIDATES = 3
+LOW_CONF_RESCUE_MIN_AREA_RATIO = 0.005
+LOW_CONF_RESCUE_MIN_OVERLAP_RATIO = 0.25
 
 
 class _TrtEngine:
@@ -595,6 +599,12 @@ class ObstaclePlugin:
         det, proto = self._out_seg_eng.run(lb_s[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0)
         inst = self._process_masks(det[0], proto[0], h, w, r_s, dw_s, dh_s, allowed)
         if not inst:
+            rescue = self._try_low_conf_rescue(
+                det[0], proto[0], depth, h, w, r_s, dw_s, dh_s, allowed,
+                min_d, max_d, offset, scale, bias, boundary_high,
+            )
+            if rescue is not None:
+                return rescue, {"fallback": False}
             return fallback, {"fallback": True}
         sel = np.where(np.array([c for _, c, _ in inst]) >= min_conf)[0]
         if sel.size == 0:
@@ -653,6 +663,87 @@ class ObstaclePlugin:
                  f"boundary_switch={boundary_switch} support_switch={support_switch} "
                  f"pred={pred:.3f}m")
         return pred, {"fallback": fallback_used}
+
+    @staticmethod
+    def _try_low_conf_rescue(detections, prototypes, depth, oh, ow, ratio,
+                             dw, dh, allowed, min_d, max_d, offset, scale,
+                             bias, boundary_high):
+        detections = np.asarray(detections, dtype=np.float32)
+        prototypes = np.asarray(prototypes)
+        candidates = [
+            (index, det) for index, det in enumerate(detections)
+            if (LOW_CONF_RESCUE_MIN <= float(det[4]) < MASK_CONF_FLOOR and
+                int(det[5]) in allowed)
+        ]
+        candidates.sort(key=lambda item: -float(item[1][4]))
+        candidates = candidates[:LOW_CONF_RESCUE_MAX_CANDIDATES]
+
+        channels, _, _ = prototypes.shape
+        proto_flat = prototypes.reshape(channels, -1)
+        unpad_h = min(int(round(oh * ratio)), 640 - dh)
+        unpad_w = min(int(round(ow * ratio)), 640 - dw)
+        rows = np.arange(640, dtype=np.float32)[:, None]
+        cols = np.arange(640, dtype=np.float32)[None, :]
+        best = None
+
+        for _, det in candidates:
+            try:
+                coeff = det[6:6 + channels]
+                logit = (coeff @ proto_flat).reshape(prototypes.shape[1:])
+                up = cv2.resize(logit, (640, 640), interpolation=cv2.INTER_LINEAR)
+                x1, y1, x2, y2 = det[0], det[1], det[2], det[3]
+                mask = up > 0.0
+                mask &= cols >= x1
+                mask &= cols < x2
+                mask &= rows >= y1
+                mask &= rows < y2
+                if not mask.any():
+                    continue
+                mask = mask[dh:dh + unpad_h, dw:dw + unpad_w]
+                mask = cv2.resize(mask.astype(np.uint8), (ow, oh),
+                                  interpolation=cv2.INTER_NEAREST).astype(bool)
+                mask_pixels = int(mask.sum())
+                if mask_pixels == 0:
+                    continue
+
+                valid = (mask & np.isfinite(depth) &
+                         (depth >= min_d) & (depth <= max_d))
+                if not valid.any():
+                    continue
+                vals = np.maximum(depth[valid].astype(np.float32) - offset, 0.0)
+                raw_p5 = float(np.percentile(vals, 5.0))
+                raw_p10 = float(np.percentile(vals, 10.0))
+                pred_p5 = float(np.clip(scale * raw_p5 + bias, 0, max_d))
+                pred_p10 = float(np.clip(scale * raw_p10 + bias, 0, max_d))
+                area_ratio = float(mask_pixels) / float(oh * ow)
+                x_start = int(0.25 * ow)
+                x_end = int(0.75 * ow)
+                central_overlap_pixels = int(mask[:, x_start:x_end].sum())
+                central_overlap_ratio = (float(central_overlap_pixels) /
+                                         float(mask_pixels))
+                rescue_limit = min(boundary_high, 2.0)
+                accepted = (pred_p5 < rescue_limit and
+                            pred_p10 < rescue_limit and
+                            area_ratio >= LOW_CONF_RESCUE_MIN_AREA_RATIO and
+                            central_overlap_pixels > 0 and
+                            central_overlap_ratio >= LOW_CONF_RESCUE_MIN_OVERLAP_RATIO)
+                if accepted and (best is None or pred_p5 < best[0]):
+                    best = (pred_p5, int(det[5]), float(det[4]), pred_p10,
+                            area_ratio, central_overlap_ratio)
+            except (IndexError, ValueError, TypeError, cv2.error):
+                continue
+
+        if best is None:
+            log.info(f"[obstacle] outdoor lowconf rescue: success=False "
+                     f"candidate_count={len(candidates)} pred=3.000m")
+            return None
+
+        pred_p5, class_id, confidence, pred_p10, area_ratio, overlap_ratio = best
+        log.info(f"[obstacle] outdoor lowconf rescue: success=True class={class_id} "
+                 f"conf={confidence:.3f} P5={pred_p5:.3f}m P10={pred_p10:.3f}m "
+                 f"area={area_ratio:.4f} overlap={overlap_ratio:.3f} "
+                 f"pred={pred_p5:.3f}m")
+        return pred_p5
 
     @staticmethod
     def _process_masks(detections, prototypes, oh, ow, ratio, dw, dh, allowed):
