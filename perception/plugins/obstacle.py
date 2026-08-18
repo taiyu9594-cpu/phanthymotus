@@ -80,6 +80,31 @@ RESCUE_UPPER_BOUND = 2.495905647277832
 RESCUE_GAP_THRESHOLD = 0.35293271780014046
 RESCUE_DISTANCE = 1.99
 DECISION_THRESHOLD = 2.0
+INDOOR_GEOMETRY_ROI = (213, 0, 426, 300)
+GEOMETRY_FX = 525.0
+GEOMETRY_FY = 525.0
+GEOMETRY_CX = 319.5
+GEOMETRY_CY = 239.5
+GEOMETRY_MIN_DEPTH = 0.05
+GEOMETRY_MAX_DEPTH = 20.0
+FLOOR_CANDIDATE_START_RATIO = 0.55
+FLOOR_MAX_CANDIDATE_POINTS = 30000
+FLOOR_RANSAC_ITERS = 300
+FLOOR_DISTANCE_THRESHOLD = 0.08
+FLOOR_NORMAL_MIN_Y = 0.75
+FLOOR_MIN_INLIERS = 500
+FLOOR_MIN_INLIER_RATIO = 0.10
+CAMERA_HEIGHT_MIN = 0.20
+CAMERA_HEIGHT_MAX = 2.50
+RANSAC_SEED = 0
+OBSTACLE_HEIGHT_MIN = 0.05
+OBSTACLE_HEIGHT_MAX = 2.20
+MASK_MORPH_KERNEL = 3
+MIN_OBSTACLE_COMPONENT_PIXELS = 30
+MIN_OBSTACLE_PIXELS_FOR_P1 = 50
+GEOMETRY_VETO_P1 = 1.80
+GEOMETRY_VETO_FLOOR_INLIER_RATIO = 0.985
+GEOMETRY_VETO_DISTANCE = 2.01
 
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
@@ -560,9 +585,208 @@ class ObstaclePlugin:
                    (p10 - raw_min) < self._rescue_gap_threshold)
         pred = self._rescue_distance if rescued else pred_iso
         pred = float(np.clip(pred, INDOOR_CLIP[0], INDOOR_CLIP[1]))
+        geometry_ran = False
+        geometry_p1 = None
+        floor_inlier_ratio = None
+        geometry_ms = 0.0
+        vetoed = False
+        if pred < DECISION_THRESHOLD:
+            geometry_ran = True
+            geometry_t0 = time.perf_counter()
+            try:
+                geometry = self._indoor_geometry(depth_original)
+                if geometry is not None:
+                    geometry_p1, floor_inlier_ratio = geometry
+                    vetoed = (geometry_p1 >= GEOMETRY_VETO_P1 and
+                              floor_inlier_ratio >= GEOMETRY_VETO_FLOOR_INLIER_RATIO)
+                    if vetoed:
+                        pred = GEOMETRY_VETO_DISTANCE
+            except Exception as e:
+                log.warning(f"[obstacle] indoor geometry failed open: {e}")
+            geometry_ms = (time.perf_counter() - geometry_t0) * 1000.0
         log.info(f"[obstacle] indoor infer: raw_min={raw_min:.3f}m p10={p10:.3f}m "
-                 f"pred_iso={pred_iso:.3f}m rescued={rescued} pred={pred:.3f}m")
+                 f"pred_iso={pred_iso:.3f}m rescued={rescued} "
+                 f"geometry_run={geometry_ran} "
+                 f"geometry_p1={geometry_p1 if geometry_p1 is not None else 'n/a'} "
+                 f"floor_inlier_ratio={floor_inlier_ratio if floor_inlier_ratio is not None else 'n/a'} "
+                 f"geometry_ms={geometry_ms:.1f} veto={vetoed} pred={pred:.3f}m")
         return pred, {"fallback": False}
+
+    @staticmethod
+    def _indoor_geometry(depth):
+        """Reference-equivalent indoor geometry veto features.
+
+        Returns (geometry_p1, floor_inlier_ratio) on success, otherwise None.
+        This mirrors the validated GeometryObstacleMasker path: metric-depth
+        validity clipping, deterministic candidate downsampling, seeded RANSAC,
+        SVD plane refit, strict official ROI, ellipse morphology, CC filtering,
+        and obstacle-depth P1.
+        """
+        depth = np.asarray(depth, dtype=np.float32)
+        if depth.shape != (480, 640):
+            return None
+
+        h, w = depth.shape
+        valid = (np.isfinite(depth) &
+                 (depth > GEOMETRY_MIN_DEPTH) &
+                 (depth <= GEOMETRY_MAX_DEPTH))
+
+        # Match the reference projection/order exactly: build full-image
+        # X/Y coordinates first, then select floor candidates in row-major order.
+        ys, xs = np.indices((h, w), dtype=np.float32)
+        x = (xs - GEOMETRY_CX) * depth / GEOMETRY_FX
+        y = (ys - GEOMETRY_CY) * depth / GEOMETRY_FY
+
+        candidate = valid & (
+            ys >= round(h * FLOOR_CANDIDATE_START_RATIO)
+        )
+        points = np.column_stack((
+            x[candidate],
+            y[candidate],
+            depth[candidate],
+        )).astype(np.float64)
+
+        count = len(points)
+        if count < 3:
+            return None
+
+        # Reference uses deterministic evenly-spaced downsampling, not RNG.
+        if count > FLOOR_MAX_CANDIDATE_POINTS:
+            take = np.linspace(
+                0,
+                count - 1,
+                FLOOR_MAX_CANDIDATE_POINTS,
+                dtype=np.int64,
+            )
+            points = points[take]
+            count = len(points)
+
+        # RNG state begins here in the reference implementation.
+        rng = np.random.default_rng(RANSAC_SEED)
+        best_inliers = None
+        best_count = -1
+        best_residual = np.inf
+
+        for _ in range(FLOOR_RANSAC_ITERS):
+            ids = rng.choice(count, 3, replace=False)
+            a, b, c = points[ids]
+
+            normal = np.cross(b - a, c - a)
+            norm = np.linalg.norm(normal)
+            if norm < 1e-10:
+                continue
+
+            normal = normal / norm
+            plane_d = -float(np.dot(normal, a))
+            if normal[1] < 0.0:
+                normal = -normal
+                plane_d = -plane_d
+
+            if normal[1] < FLOOR_NORMAL_MIN_Y:
+                continue
+            if not CAMERA_HEIGHT_MIN <= abs(plane_d) <= CAMERA_HEIGHT_MAX:
+                continue
+
+            distances = np.abs(points @ normal + plane_d)
+            inliers = distances <= FLOOR_DISTANCE_THRESHOLD
+            n_inliers = int(inliers.sum())
+            residual = (
+                float(distances[inliers].mean())
+                if n_inliers
+                else np.inf
+            )
+
+            if (n_inliers > best_count or
+                    (n_inliers == best_count and
+                     residual < best_residual)):
+                best_inliers = inliers
+                best_count = n_inliers
+                best_residual = residual
+
+        if best_inliers is None:
+            return None
+        if best_count < FLOOR_MIN_INLIERS:
+            return None
+
+        floor_inlier_ratio = float(best_count) / float(count)
+        if floor_inlier_ratio < FLOOR_MIN_INLIER_RATIO:
+            return None
+
+        # Match GeometryObstacleMasker._plane(): SVD refit on best inliers.
+        floor_points = points[best_inliers]
+        centroid = floor_points.mean(axis=0)
+        _, _, vh = np.linalg.svd(
+            floor_points - centroid,
+            full_matrices=False,
+        )
+        normal = vh[-1]
+        normal_norm = np.linalg.norm(normal)
+        if normal_norm < 1e-12:
+            return None
+
+        normal = normal / normal_norm
+        plane_d = -float(np.dot(normal, centroid))
+        if normal[1] < 0.0:
+            normal = -normal
+            plane_d = -plane_d
+
+        if normal[1] < FLOOR_NORMAL_MIN_Y:
+            return None
+
+        camera_height = abs(float(plane_d))
+        if not CAMERA_HEIGHT_MIN <= camera_height <= CAMERA_HEIGHT_MAX:
+            return None
+
+        # Build the same geometry obstacle mask, then restrict it to the
+        # strict official ROI: rows [0:300), cols [213:426).
+        signed = (
+            normal[0] * x +
+            normal[1] * y +
+            normal[2] * depth +
+            plane_d
+        )
+        obstacle = (
+            valid &
+            (-signed >= OBSTACLE_HEIGHT_MIN) &
+            (-signed <= OBSTACLE_HEIGHT_MAX)
+        )
+
+        x1, y1, x2, y2 = INDOOR_GEOMETRY_ROI
+        in_roi = np.zeros((h, w), dtype=bool)
+        in_roi[max(0, y1):min(h, y2),
+               max(0, x1):min(w, x2)] = True
+        obstacle &= in_roi
+
+        binary = obstacle.astype(np.uint8) * 255
+        if MASK_MORPH_KERNEL > 1:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (MASK_MORPH_KERNEL, MASK_MORPH_KERNEL),
+            )
+            binary = cv2.morphologyEx(
+                binary,
+                cv2.MORPH_OPEN,
+                kernel,
+            )
+
+        component_count, labels, stats, _ = (
+            cv2.connectedComponentsWithStats(binary, 8)
+        )
+        keep = np.zeros((h, w), dtype=bool)
+        for label in range(1, component_count):
+            if (stats[label, cv2.CC_STAT_AREA] >=
+                    MIN_OBSTACLE_COMPONENT_PIXELS):
+                keep |= labels == label
+
+        values = depth[keep & valid]
+        if len(values) < MIN_OBSTACLE_PIXELS_FOR_P1:
+            return None
+
+        geometry_p1 = float(np.percentile(values, 1.0))
+        if not np.isfinite(geometry_p1):
+            return None
+
+        return geometry_p1, floor_inlier_ratio
 
     # ── 室外：yolo26n depth + seg ─────────────────────────────────────────
     def _detect_outdoor(self, bgr) -> tuple[float, dict]:
