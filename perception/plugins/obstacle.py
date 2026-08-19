@@ -585,6 +585,7 @@ class ObstaclePlugin:
                    (p10 - raw_min) < self._rescue_gap_threshold)
         pred = self._rescue_distance if rescued else pred_iso
         pred = float(np.clip(pred, INDOOR_CLIP[0], INDOOR_CLIP[1]))
+        gap = p10 - raw_min
         geometry_ran = False
         geometry_p1 = None
         floor_inlier_ratio = None
@@ -599,6 +600,11 @@ class ObstaclePlugin:
                     geometry_p1, floor_inlier_ratio = geometry
                     vetoed = (geometry_p1 >= GEOMETRY_VETO_P1 and
                               floor_inlier_ratio >= GEOMETRY_VETO_FLOOR_INLIER_RATIO)
+                    high_veto = (rescued and gap >= 0.25 and
+                                 floor_inlier_ratio >= 0.985)
+                    low_veto = (rescued and geometry_p1 >= 2.03 and
+                                floor_inlier_ratio <= 0.80 and gap >= 0.20)
+                    vetoed = vetoed or high_veto or low_veto
                     if vetoed:
                         pred = GEOMETRY_VETO_DISTANCE
             except Exception as e:
