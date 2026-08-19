@@ -586,12 +586,13 @@ class ObstaclePlugin:
         pred = self._rescue_distance if rescued else pred_iso
         pred = float(np.clip(pred, INDOOR_CLIP[0], INDOOR_CLIP[1]))
         gap = p10 - raw_min
+        geometry_needed = rescued or (gap >= 0.25 and p10 <= 2.40)
         geometry_ran = False
         geometry_p1 = None
         floor_inlier_ratio = None
         geometry_ms = 0.0
         vetoed = False
-        if pred < DECISION_THRESHOLD:
+        if pred < DECISION_THRESHOLD and geometry_needed:
             geometry_ran = True
             geometry_t0 = time.perf_counter()
             try:
