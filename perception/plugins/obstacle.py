@@ -603,7 +603,7 @@ class ObstaclePlugin:
                     high_veto = (rescued and gap >= 0.25 and
                                  floor_inlier_ratio >= 0.985)
                     low_veto = (rescued and geometry_p1 >= 2.03 and
-                                floor_inlier_ratio <= 0.80 and gap >= 0.20)
+                                floor_inlier_ratio <= 0.80 and gap >= 0.26)
                     vetoed = vetoed or high_veto or low_veto
                     if vetoed:
                         pred = GEOMETRY_VETO_DISTANCE
