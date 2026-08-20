@@ -105,6 +105,12 @@ MIN_OBSTACLE_PIXELS_FOR_P1 = 50
 GEOMETRY_VETO_P1 = 1.80
 GEOMETRY_VETO_FLOOR_INLIER_RATIO = 0.985
 GEOMETRY_VETO_DISTANCE = 2.01
+NEGATIVE_GEOMETRY_RESCUE_ENABLED = True
+NEGATIVE_GEOMETRY_RESCUE_PRED_LOW = 2.0
+NEGATIVE_GEOMETRY_RESCUE_PRED_HIGH = 2.25
+NEGATIVE_GEOMETRY_RESCUE_GEOMETRY_MAX = 2.0
+NEGATIVE_GEOMETRY_RESCUE_FLOOR_MAX_RATIO = 0.985
+NEGATIVE_GEOMETRY_RESCUE_OUTPUT = 1.99
 
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
@@ -585,37 +591,50 @@ class ObstaclePlugin:
                    (p10 - raw_min) < self._rescue_gap_threshold)
         pred = self._rescue_distance if rescued else pred_iso
         pred = float(np.clip(pred, INDOOR_CLIP[0], INDOOR_CLIP[1]))
+        scalar_pred = pred
         gap = p10 - raw_min
         geometry_ran = False
         geometry_p1 = None
         floor_inlier_ratio = None
         geometry_ms = 0.0
         vetoed = False
-        if pred < DECISION_THRESHOLD:
+        negative_geometry_rescued = False
+        negative_geometry_eligible = (
+            NEGATIVE_GEOMETRY_RESCUE_ENABLED and
+            scalar_pred >= NEGATIVE_GEOMETRY_RESCUE_PRED_LOW and
+            scalar_pred <= NEGATIVE_GEOMETRY_RESCUE_PRED_HIGH
+        )
+        if scalar_pred < DECISION_THRESHOLD or negative_geometry_eligible:
             geometry_ran = True
             geometry_t0 = time.perf_counter()
             try:
                 geometry = self._indoor_geometry(depth_original)
                 if geometry is not None:
                     geometry_p1, floor_inlier_ratio = geometry
-                    vetoed = (geometry_p1 >= GEOMETRY_VETO_P1 and
-                              floor_inlier_ratio >= GEOMETRY_VETO_FLOOR_INLIER_RATIO)
-                    high_veto = (rescued and gap >= 0.25 and
-                                 floor_inlier_ratio >= 0.985)
-                    low_veto = (rescued and geometry_p1 >= 2.03 and
-                                floor_inlier_ratio <= 0.80 and gap >= 0.26)
-                    vetoed = vetoed or high_veto or low_veto
-                    if vetoed:
-                        pred = GEOMETRY_VETO_DISTANCE
+                    if scalar_pred < DECISION_THRESHOLD:
+                        vetoed = (geometry_p1 >= GEOMETRY_VETO_P1 and
+                                  floor_inlier_ratio >= GEOMETRY_VETO_FLOOR_INLIER_RATIO)
+                        high_veto = (rescued and gap >= 0.25 and
+                                     floor_inlier_ratio >= 0.985)
+                        low_veto = (rescued and geometry_p1 >= 2.03 and
+                                    floor_inlier_ratio <= 0.80 and gap >= 0.26)
+                        vetoed = vetoed or high_veto or low_veto
+                        if vetoed:
+                            pred = GEOMETRY_VETO_DISTANCE
+                    elif (geometry_p1 < NEGATIVE_GEOMETRY_RESCUE_GEOMETRY_MAX and
+                          floor_inlier_ratio < NEGATIVE_GEOMETRY_RESCUE_FLOOR_MAX_RATIO):
+                        pred = NEGATIVE_GEOMETRY_RESCUE_OUTPUT
+                        negative_geometry_rescued = True
             except Exception as e:
                 log.warning(f"[obstacle] indoor geometry failed open: {e}")
             geometry_ms = (time.perf_counter() - geometry_t0) * 1000.0
         log.info(f"[obstacle] indoor infer: raw_min={raw_min:.3f}m p10={p10:.3f}m "
-                 f"pred_iso={pred_iso:.3f}m rescued={rescued} "
+                 f"pred_iso={pred_iso:.3f}m rescued={rescued} scalar_pred={scalar_pred:.3f}m "
                  f"geometry_run={geometry_ran} "
                  f"geometry_p1={geometry_p1 if geometry_p1 is not None else 'n/a'} "
                  f"floor_inlier_ratio={floor_inlier_ratio if floor_inlier_ratio is not None else 'n/a'} "
-                 f"geometry_ms={geometry_ms:.1f} veto={vetoed} pred={pred:.3f}m")
+                 f"geometry_ms={geometry_ms:.1f} veto={vetoed} "
+                 f"negative_geometry_rescued={negative_geometry_rescued} pred={pred:.3f}m")
         return pred, {"fallback": False}
 
     @staticmethod
