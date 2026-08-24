@@ -286,18 +286,22 @@ class _ObstacleDistanceNode(Node):
         self._stop_event = threading.Event()
         self._worker = None
         self._detect_count = 0
+        self._callback_count = 0
+        self._start_monotonic = None
 
     def start(self) -> dict:
         if self._sub is not None:
             return {"state": "running", "input": self._input_topic, "output": self._output_topic}
+        self._start_monotonic = time.monotonic()
         self._stop_event.clear()
         self._sub = self.create_subscription(
             CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
         )
+        log.info(f"[obstacle] subscription_created: topic={self._input_topic}")
         self._worker = threading.Thread(target=self._inference_worker, daemon=True,
                                         name=f"obstacle_ros_{self._input_topic}")
         self._worker.start()
-        log.info(f"[obstacle] ros2 started: {self._input_topic} -> {self._output_topic}")
+        log.info(f"[obstacle] worker_started: topic={self._input_topic}")
         return {"state": "running", "input": self._input_topic, "output": self._output_topic}
 
     def stop(self) -> dict:
@@ -308,10 +312,17 @@ class _ObstacleDistanceNode(Node):
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=3.0)
         self._worker = None
-        log.info(f"[obstacle] ros2 stopped: {self._input_topic}")
+        log.info(f"[obstacle] ros2 stopped: topic={self._input_topic} "
+                 f"callback_count={self._callback_count} detect_count={self._detect_count}")
         return {"state": "idle", "input": self._input_topic}
 
     def _image_cb(self, msg: CompressedImage):
+        self._callback_count += 1
+        if self._callback_count == 1:
+            since_start_ms = ((time.monotonic() - self._start_monotonic) * 1000.0
+                              if self._start_monotonic is not None else -1.0)
+            log.info(f"[obstacle] first_callback: topic={self._input_topic} "
+                     f"since_start_ms={since_start_ms:.1f} message_bytes={len(msg.data)}")
         fmt = msg.format or ""
         try:
             self._frame_queue.put_nowait((msg.data, fmt))
@@ -485,19 +496,51 @@ class ObstaclePlugin:
 
     # ── ROS2 节点生命周期（vop 同款多实例）───────────────────────────────
     def _ros2_start(self, args: dict) -> dict:
+        start_t0 = time.monotonic()
         if self._load_status != "ready":
             return {"ok": False, "error": f"models not ready: {self._load_error or self._load_status}"}
         input_topic = (args.get("input_topic") or self._cfg.get("input_topic") or "").strip()
         if not input_topic:
             return {"ok": False, "error": "input_topic is required for action=start"}
+        log.info(f"[obstacle] start_requested: topic={input_topic}")
         if input_topic in self._nodes:
-            return self._nodes[input_topic].start()
+            result = self._nodes[input_topic].start()
+            log.info(f"[obstacle] start_returned: topic={input_topic} existing=True")
+            return result
         output_topic = (args.get("output_topic") or self._output_topic_tpl).format(input_topic=input_topic)
         suffix = input_topic.replace("/", "_").replace("-", "_")
         node = _ObstacleDistanceNode(self, input_topic, output_topic, suffix)
-        self._executor.add_node(node)
+        result = node.start()
+        try:
+            added = self._executor.add_node(node)
+            if not added:
+                raise RuntimeError(f"failed to add obstacle node to executor: {input_topic}")
+        except Exception:
+            node.stop()
+            raise
+        log.info(f"[obstacle] executor_added: topic={input_topic}")
         self._nodes[input_topic] = node
-        return node.start()
+
+        discovery_t0 = time.monotonic()
+        deadline = discovery_t0 + 2.0
+        publisher_count = node.count_publishers(input_topic)
+        while publisher_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+            publisher_count = node.count_publishers(input_topic)
+        if publisher_count > 0:
+            log.info(f"[obstacle] discovery_ready: topic={input_topic} "
+                     f"publisher_count={publisher_count}")
+            time.sleep(0.20)
+        else:
+            log.warning(f"[obstacle] discovery_timeout: topic={input_topic} "
+                        f"publisher_count={publisher_count}")
+        discovery_wait_ms = (time.monotonic() - discovery_t0) * 1000.0
+        log.info(f"[obstacle] publisher_count: topic={input_topic} count={publisher_count} "
+                 f"discovery_wait_ms={discovery_wait_ms:.1f}")
+        log.info(f"[obstacle] ros2 started: {input_topic} -> {output_topic}")
+        log.info(f"[obstacle] start_returned: topic={input_topic} existing=False "
+                 f"total_start_ms={(time.monotonic() - start_t0) * 1000.0:.1f}")
+        return result
 
     def _ros2_stop(self, args: dict) -> dict:
         input_topic = (args.get("input_topic") or "").strip()
