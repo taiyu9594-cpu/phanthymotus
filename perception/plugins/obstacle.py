@@ -864,12 +864,12 @@ class ObstaclePlugin:
         fallback_used = False
         if pred < boundary_high:
             near_instances = [record for record in instance_predictions
-                              if record[1] < boundary_high]
+                              if record[0] < boundary_high]
             if (near_instances and
                     all(area_ratio < support_threshold
                         for _, _, area_ratio in near_instances)):
-                remaining = [inst_pred_p5 for inst_pred_p5, inst_pred_p1, _
-                             in instance_predictions if inst_pred_p1 >= boundary_high]
+                remaining = [inst_pred_p5 for inst_pred_p5, _, _
+                             in instance_predictions if inst_pred_p5 >= boundary_high]
                 if remaining:
                     pred = min(remaining)
                 else:
