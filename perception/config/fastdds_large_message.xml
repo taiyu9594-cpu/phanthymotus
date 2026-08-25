@@ -12,6 +12,14 @@
 
     <participant profile_name="large_message_profile" is_default_profile="true">
         <rtps>
+            <builtin>
+                <discovery_config>
+                    <leaseAnnouncement>
+                        <sec>0</sec>
+                        <nanosec>50000000</nanosec>
+                    </leaseAnnouncement>
+                </discovery_config>
+            </builtin>
             <userTransports>
                 <transport_id>CustomUDPTransport</transport_id>
             </userTransports>

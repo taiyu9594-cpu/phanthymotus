@@ -305,15 +305,22 @@ class _ObstacleDistanceNode(Node):
         return {"state": "running", "input": self._input_topic, "output": self._output_topic}
 
     def stop(self) -> dict:
+        subscription_error = None
         if self._sub is not None:
-            self.destroy_subscription(self._sub)
-            self._sub = None
+            try:
+                self.destroy_subscription(self._sub)
+            except Exception as e:
+                subscription_error = e
+            finally:
+                self._sub = None
         self._stop_event.set()
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=3.0)
         self._worker = None
         log.info(f"[obstacle] ros2 stopped: topic={self._input_topic} "
                  f"callback_count={self._callback_count} detect_count={self._detect_count}")
+        if subscription_error is not None:
+            raise subscription_error
         return {"state": "idle", "input": self._input_topic}
 
     def _image_cb(self, msg: CompressedImage):
@@ -542,17 +549,45 @@ class ObstaclePlugin:
                  f"total_start_ms={(time.monotonic() - start_t0) * 1000.0:.1f}")
         return result
 
+    def _cleanup_ros2_node(self, node: _ObstacleDistanceNode) -> list[str]:
+        topic = node._input_topic
+        errors = []
+        try:
+            node.stop()
+        except Exception as e:
+            errors.append(f"stop: {e}")
+            log.error(f"[obstacle] node stop failed: topic={topic} error={e}")
+        try:
+            self._executor.remove_node(node)
+        except Exception as e:
+            errors.append(f"remove_node: {e}")
+            log.error(f"[obstacle] executor remove failed: topic={topic} error={e}")
+        remaining = len(self._nodes)
+        log.info(f"[obstacle] before_destroy_node: topic={topic} "
+                 f"remaining_nodes={remaining}")
+        try:
+            node.destroy_node()
+            log.info(f"[obstacle] after_destroy_node: topic={topic} "
+                     f"remaining_nodes={remaining}")
+        except Exception as e:
+            errors.append(f"destroy_node: {e}")
+            log.error(f"[obstacle] node destroy failed: topic={topic} error={e}")
+        return errors
+
     def _ros2_stop(self, args: dict) -> dict:
         input_topic = (args.get("input_topic") or "").strip()
         if input_topic and input_topic in self._nodes:
             node = self._nodes.pop(input_topic)
-            node.stop()
-            self._executor.remove_node(node)
+            errors = self._cleanup_ros2_node(node)
+            if errors:
+                raise RuntimeError(f"obstacle stop cleanup failed: {'; '.join(errors)}")
             return {"state": "idle", "input": input_topic}
+        errors = []
         for k in list(self._nodes.keys()):
-            self._nodes[k].stop()
-            self._executor.remove_node(self._nodes[k])
-        self._nodes.clear()
+            node = self._nodes.pop(k)
+            errors.extend(self._cleanup_ros2_node(node))
+        if errors:
+            raise RuntimeError(f"obstacle stop cleanup failed: {'; '.join(errors)}")
         return {"state": "idle"}
 
     # ── 检测入口 ──────────────────────────────────────────────────────────
