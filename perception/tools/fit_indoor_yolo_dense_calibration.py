@@ -20,6 +20,13 @@ import numpy as np
 SEQUENCES = ("slam1", "slam2", "slam3", "pioneer_360")
 FEATURES = ("min", "p1", "p5", "p10")
 CALIBRATIONS = ("raw", "dense_scale", "dense_affine")
+GT_RANGES = (
+    ("gt_le_2p5", 2.5),
+    ("gt_le_3p0", 3.0),
+    ("gt_le_4p0", 4.0),
+    ("gt_le_5p0", 5.0),
+    ("all", None),
+)
 ROI_ROWS = (0, 300)
 ROI_COLS = (213, 426)
 
@@ -346,9 +353,15 @@ def _accumulate_sequence_stats(
     infer_yolo: Callable[[object, np.ndarray], np.ndarray],
     alignments: Sequence[Alignment],
     depth_scale: float,
-) -> tuple[dict[str, DenseStats], dict[str, int]]:
-    stats = {sequence: DenseStats() for sequence in SEQUENCES}
-    usable_frames = {sequence: 0 for sequence in SEQUENCES}
+) -> tuple[dict[str, dict[str, DenseStats]], dict[str, dict[str, int]]]:
+    stats = {
+        range_name: {sequence: DenseStats() for sequence in SEQUENCES}
+        for range_name, _ in GT_RANGES
+    }
+    usable_frames = {
+        range_name: {sequence: 0 for sequence in SEQUENCES}
+        for range_name, _ in GT_RANGES
+    }
     matched = [item for item in alignments if item.matched]
     for index, item in enumerate(matched, start=1):
         if item.depth_path is None:
@@ -356,12 +369,18 @@ def _accumulate_sequence_stats(
         pred = infer_yolo(engine, _read_rgb(item.row.image_path))
         gt = _read_tum_depth(item.depth_path, depth_scale)
         x, y = _valid_dense_pairs(pred, gt)
-        if x.size:
-            stats[item.row.sequence].add_arrays(x, y)
-            usable_frames[item.row.sequence] += 1
+        range_counts = {}
+        for range_name, upper_bound in GT_RANGES:
+            selected = np.ones(y.shape, dtype=bool) if upper_bound is None else y <= upper_bound
+            range_x = x[selected]
+            range_y = y[selected]
+            range_counts[range_name] = int(range_x.size)
+            if range_x.size:
+                stats[range_name][item.row.sequence].add_arrays(range_x, range_y)
+                usable_frames[range_name][item.row.sequence] += 1
         print(
             f"dense_stats [{index}/{len(matched)}] {item.row.sequence}:"
-            f"{item.row.source_index} valid_pairs={x.size}",
+            f"{item.row.source_index} valid_pairs={json.dumps(range_counts, sort_keys=True)}",
             flush=True,
         )
     return stats, usable_frames
@@ -434,6 +453,31 @@ def _build_folds(
     return folds
 
 
+def _build_range_folds(
+    stats_by_range: dict[str, dict[str, DenseStats]],
+    usable_frames_by_range: dict[str, dict[str, int]],
+    alignments: Sequence[Alignment],
+) -> dict[str, list[dict[str, object]]]:
+    folds_by_range = {}
+    for range_name, upper_bound in GT_RANGES:
+        folds = _build_folds(
+            stats_by_range[range_name], usable_frames_by_range[range_name], alignments
+        )
+        for fold in folds:
+            fold["gt_range"] = range_name
+            fold["fit_gt_depth_upper_bound_m"] = upper_bound
+            affine_b = float(fold["affine"]["b"])  # type: ignore[index]
+            fold["affine_intercept_ge_2m"] = affine_b >= 2.0
+            if affine_b >= 2.0:
+                print(
+                    f"WARNING holdout={fold['holdout_sequence']} gt_range={range_name} "
+                    f"dense_affine_b={affine_b:.9f} >= 2.0; parameter left unchanged",
+                    flush=True,
+                )
+        folds_by_range[range_name] = folds
+    return folds_by_range
+
+
 def _depth_features(depth: np.ndarray) -> dict[str, float]:
     roi = depth[ROI_ROWS[0] : ROI_ROWS[1], ROI_COLS[0] : ROI_COLS[1]]
     values = roi[np.isfinite(roi) & (roi > 0.0)]
@@ -453,17 +497,25 @@ def _evaluate_frames(
     infer_yolo: Callable[[object, np.ndarray], np.ndarray],
     rows: Sequence[ManifestRow],
     folds: Sequence[dict[str, object]],
-) -> list[dict[str, object]]:
+    folds_by_range: dict[str, list[dict[str, object]]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     fold_by_sequence = {str(fold["holdout_sequence"]): fold for fold in folds}
+    range_fold_by_sequence = {
+        range_name: {
+            str(fold["holdout_sequence"]): fold for fold in range_folds
+        }
+        for range_name, range_folds in folds_by_range.items()
+    }
     predictions = []
+    near_predictions = []
     for index, row in enumerate(rows, start=1):
         fold = fold_by_sequence[row.sequence]
         raw = infer_yolo(engine, _read_rgb(row.image_path))
+        raw_features = _depth_features(raw)
         scale_a = float(fold["scale"]["a"])  # type: ignore[index]
         affine_a = float(fold["affine"]["a"])  # type: ignore[index]
         affine_b = float(fold["affine"]["b"])  # type: ignore[index]
         maps = {
-            "raw": raw,
             "dense_scale": scale_a * raw,
             "dense_affine": affine_a * raw + affine_b,
         }
@@ -478,12 +530,34 @@ def _evaluate_frames(
             "dense_affine_a": affine_a,
             "dense_affine_b": affine_b,
         }
+        for feature, value in raw_features.items():
+            output[f"raw_{feature}"] = value
         for calibration, depth in maps.items():
             for feature, value in _depth_features(depth).items():
                 output[f"{calibration}_{feature}"] = value
         predictions.append(output)
+
+        near_output: dict[str, object] = {
+            "sequence": row.sequence,
+            "source_index": row.source_index,
+            "gt_distance": row.gt_distance,
+        }
+        for range_name, _ in GT_RANGES:
+            range_fold = range_fold_by_sequence[range_name][row.sequence]
+            range_scale_a = float(range_fold["scale"]["a"])  # type: ignore[index]
+            range_affine_a = float(range_fold["affine"]["a"])  # type: ignore[index]
+            range_affine_b = float(range_fold["affine"]["b"])  # type: ignore[index]
+            range_maps = {
+                "dense_scale": range_scale_a * raw,
+                "dense_affine": range_affine_a * raw + range_affine_b,
+            }
+            for calibration, depth in range_maps.items():
+                features = _depth_features(depth)
+                for feature, value in features.items():
+                    near_output[f"{range_name}:{calibration}:{feature}"] = value
+        near_predictions.append(near_output)
         print(f"holdout_eval [{index}/{len(rows)}] {row.sequence}:{row.source_index}", flush=True)
-    return predictions
+    return predictions, near_predictions
 
 
 def _metrics(gt: np.ndarray, pred: np.ndarray) -> dict[str, int | float | None]:
@@ -546,6 +620,88 @@ def _calculate_reports(
                 fold_metrics[calibration][feature] = _metric_pair(gt, pred)
         fold["holdout_metrics"] = fold_metrics
     return aggregate
+
+
+def _calculate_near_reports(
+    predictions: Sequence[dict[str, object]],
+    folds_by_range: dict[str, list[dict[str, object]]],
+) -> dict[str, dict[str, dict[str, object]]]:
+    aggregate: dict[str, dict[str, dict[str, object]]] = {}
+    for range_name, _ in GT_RANGES:
+        aggregate[range_name] = {}
+        for calibration in ("dense_scale", "dense_affine"):
+            aggregate[range_name][calibration] = {}
+            for feature in FEATURES:
+                gt = np.asarray(
+                    [row["gt_distance"] for row in predictions], dtype=np.float64
+                )
+                pred = np.asarray(
+                    [
+                        row[f"{range_name}:{calibration}:{feature}"]
+                        for row in predictions
+                    ],
+                    dtype=np.float64,
+                )
+                aggregate[range_name][calibration][feature] = _metric_pair(gt, pred)
+
+        for fold in folds_by_range[range_name]:
+            fold_rows = [
+                row
+                for row in predictions
+                if row["sequence"] == fold["holdout_sequence"]
+            ]
+            fold_metrics: dict[str, dict[str, object]] = {}
+            for calibration in ("dense_scale", "dense_affine"):
+                fold_metrics[calibration] = {}
+                for feature in FEATURES:
+                    gt = np.asarray(
+                        [row["gt_distance"] for row in fold_rows], dtype=np.float64
+                    )
+                    pred = np.asarray(
+                        [
+                            row[f"{range_name}:{calibration}:{feature}"]
+                            for row in fold_rows
+                        ],
+                        dtype=np.float64,
+                    )
+                    fold_metrics[calibration][feature] = _metric_pair(gt, pred)
+            fold["holdout_metrics_full_sequence"] = fold_metrics
+    return aggregate
+
+
+def _candidate_key(candidate: dict[str, object]) -> tuple[float, float, float]:
+    metrics = candidate["metrics"]["all"]  # type: ignore[index]
+    return (float(metrics["f1"]), -float(metrics["mae"]), -float(metrics["rmse"]))
+
+
+def _best_near_candidates(
+    aggregate: dict[str, dict[str, dict[str, object]]]
+) -> dict[str, dict[str, object]]:
+    candidates = []
+    for range_name, upper_bound in GT_RANGES:
+        for calibration in ("dense_scale", "dense_affine"):
+            for feature in FEATURES:
+                candidates.append(
+                    {
+                        "gt_range": range_name,
+                        "fit_gt_depth_upper_bound_m": upper_bound,
+                        "calibration": calibration,
+                        "feature": feature,
+                        "metrics": aggregate[range_name][calibration][feature],
+                    }
+                )
+    near_candidates = [candidate for candidate in candidates if candidate["gt_range"] != "all"]
+    return {
+        "best_near_scale": max(
+            [c for c in near_candidates if c["calibration"] == "dense_scale"],
+            key=_candidate_key,
+        ),
+        "best_near_affine": max(
+            [c for c in near_candidates if c["calibration"] == "dense_affine"],
+            key=_candidate_key,
+        ),
+        "best_overall_dense": max(candidates, key=_candidate_key),
+    }
 
 
 def _best_feature(metrics: dict[str, object]) -> str:
@@ -626,11 +782,18 @@ def main() -> int:
     try:
         first_image = _read_rgb(rows[0].image_path)
         _warmup(engine, infer_yolo, first_image, args.warmup)
-        sequence_stats, usable_frames = _accumulate_sequence_stats(
+        sequence_stats_by_range, usable_frames_by_range = _accumulate_sequence_stats(
             engine, infer_yolo, alignments, args.depth_scale
         )
+        sequence_stats = sequence_stats_by_range["all"]
+        usable_frames = usable_frames_by_range["all"]
         folds = _build_folds(sequence_stats, usable_frames, alignments)
-        predictions = _evaluate_frames(engine, infer_yolo, rows, folds)
+        folds_by_range = _build_range_folds(
+            sequence_stats_by_range, usable_frames_by_range, alignments
+        )
+        predictions, near_predictions = _evaluate_frames(
+            engine, infer_yolo, rows, folds, folds_by_range
+        )
     finally:
         engine.close()
 
@@ -663,9 +826,60 @@ def main() -> int:
         json.dump(report, stream, indent=2, allow_nan=False)
         stream.write("\n")
 
+    near_aggregate = _calculate_near_reports(near_predictions, folds_by_range)
+    near_best = _best_near_candidates(near_aggregate)
+    near_report_path = output_dir / "dense_near_calibration_report.json"
+    near_report = {
+        "experiment_type": "dense_pixel_calibration_near_range_ablation",
+        "manifest": str(args.manifest.expanduser().resolve()),
+        "yolo_engine": str(Path(args.yolo_engine).expanduser()),
+        "fit_gt_ranges": [
+            {"name": range_name, "gt_depth_upper_bound_m": upper_bound}
+            for range_name, upper_bound in GT_RANGES
+        ],
+        "fit_range_only_affects_calibration_parameters": True,
+        "holdout_evaluation_scope": "all frames in each complete held-out sequence",
+        "holdout_evaluated_frames": len(rows),
+        "holdout_evaluated_frames_by_sequence": {
+            sequence: sum(row.sequence == sequence for row in rows)
+            for sequence in SEQUENCES
+        },
+        "roi_rows": list(ROI_ROWS),
+        "roi_cols": list(ROI_COLS),
+        "depth_scale": args.depth_scale,
+        "max_timestamp_delta_sec": args.max_timestamp_delta,
+        "threshold_rule": "gt_distance < 2.0; pred_distance < 2.0",
+        "boundary_subset": "1.5 <= gt_distance <= 2.5",
+        "alignment_overall": overall_alignment,
+        "alignment_by_sequence": sequence_alignment,
+        "sequence_sufficient_statistics_by_gt_range": {
+            range_name: {
+                sequence: sequence_stats_by_range[range_name][sequence].as_dict()
+                for sequence in SEQUENCES
+            }
+            for range_name, _ in GT_RANGES
+        },
+        "folds_by_gt_range": folds_by_range,
+        "aggregate_holdout_metrics": near_aggregate,
+        "best": near_best,
+        "selection_rule": "aggregate holdout F1, then MAE, then RMSE; no holdout fitting",
+    }
+    with near_report_path.open("w", encoding="utf-8") as stream:
+        json.dump(near_report, stream, indent=2, allow_nan=False)
+        stream.write("\n")
+
     for calibration in CALIBRATIONS:
         print(f"best_{calibration}={best[calibration]}")
+    for label in ("best_near_scale", "best_near_affine", "best_overall_dense"):
+        candidate = near_best[label]
+        candidate_metrics = candidate["metrics"]["all"]  # type: ignore[index]
+        print(
+            f"{label}=gt_range:{candidate['gt_range']},"
+            f"calibration:{candidate['calibration']},feature:{candidate['feature']},"
+            f"f1:{candidate_metrics['f1']:.9f}"
+        )
     print(f"dense_calibration_report={report_path}")
+    print(f"dense_near_calibration_report={near_report_path}")
     print(f"dense_holdout_predictions={prediction_path}")
     print(f"dense_alignment_report={alignment_path}")
     return 0
