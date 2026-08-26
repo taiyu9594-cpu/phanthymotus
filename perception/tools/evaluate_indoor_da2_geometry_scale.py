@@ -23,6 +23,7 @@ SEQUENCES = ("slam1", "slam2", "slam3", "pioneer_360")
 FEATURES = ("min", "p10")
 DEFAULT_ENGINE = "/models/obstacle/depth_anything_v2_metric_hypersim_vits_int8.trt"
 DEFAULT_CALIBRATION = "/models/obstacle/calib_tum_compliant_isotonic_rescue.json"
+DEFAULT_FIXED_GEOMETRY_SCALE = 1.0797389789860306
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,10 +39,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-timestamp-delta", type=float, default=0.02)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--expected-frame-count", type=int, default=1100)
+    parser.add_argument(
+        "--fixed-geometry-scale", type=float, default=DEFAULT_FIXED_GEOMETRY_SCALE
+    )
     parser.add_argument("--synthetic-self-test", action="store_true")
     args = parser.parse_args()
     if not args.synthetic_self_test and (args.manifest is None or args.output_dir is None):
         parser.error("--manifest and --output-dir are required unless --synthetic-self-test is used")
+    if not math.isfinite(args.fixed_geometry_scale) or args.fixed_geometry_scale <= 0.0:
+        parser.error("--fixed-geometry-scale must be finite and positive")
     return args
 
 
@@ -370,11 +376,16 @@ def main() -> int:
                 scaled_geometry, scaled_geometry_error = _run_production_geometry(
                     scale * raw, obstacle
                 )
+                fixed_geometry, fixed_geometry_error = _run_production_geometry(
+                    args.fixed_geometry_scale * raw, obstacle
+                )
             else:
                 raw_geometry = None
                 scaled_geometry = None
+                fixed_geometry = None
                 raw_geometry_error = None
                 scaled_geometry_error = None
+                fixed_geometry_error = None
             raw_decision = _geometry_decision(
                 scalar_prediction, bool(scalar["rescued"]), float(scalar["gap"]),
                 raw_geometry, obstacle,
@@ -382,6 +393,10 @@ def main() -> int:
             scaled_decision = _geometry_decision(
                 scalar_prediction, bool(scalar["rescued"]), float(scalar["gap"]),
                 scaled_geometry, obstacle,
+            )
+            fixed_decision = _geometry_decision(
+                scalar_prediction, bool(scalar["rescued"]), float(scalar["gap"]),
+                fixed_geometry, obstacle,
             )
             output: dict[str, object] = {
                 "sequence": row.sequence, "source_index": row.source_index,
@@ -391,19 +406,23 @@ def main() -> int:
                 "scalar_only_pred": scalar_prediction,
                 "raw_geometry_pred": raw_decision["prediction"],
                 "scaled_geometry_pred": scaled_decision["prediction"],
+                "fixed_geometry_pred": fixed_decision["prediction"],
             }
             for prefix, decision in (("raw_geometry", raw_decision),
-                                     ("scaled_geometry", scaled_decision)):
+                                     ("scaled_geometry", scaled_decision),
+                                     ("fixed_geometry", fixed_decision)):
                 for key in ("ran", "success", "vetoed", "geometry_p1",
                             "floor_inlier_ratio"):
                     output[f"{prefix}_{key}"] = decision[key]
             output["raw_geometry_error"] = raw_geometry_error
             output["scaled_geometry_error"] = scaled_geometry_error
+            output["fixed_geometry_error"] = fixed_geometry_error
             predictions.append(output)
             print(
                 f"geometry_eval [{index}/{len(rows)}] {row.sequence}:{row.source_index} "
                 f"scalar={scalar_prediction:.6f} raw_veto={raw_decision['vetoed']} "
-                f"scaled_veto={scaled_decision['vetoed']}", flush=True,
+                f"scaled_veto={scaled_decision['vetoed']} "
+                f"fixed_veto={fixed_decision['vetoed']}", flush=True,
             )
     finally:
         engine.close()
@@ -411,10 +430,11 @@ def main() -> int:
     fields = [
         "sequence", "source_index", "image_path", "gt_distance", "scale_a",
         "raw_min", "p10", "pred_iso", "rescued", "scalar_only_pred",
-        "raw_geometry_pred", "scaled_geometry_pred",
-        *[f"{prefix}_{key}" for prefix in ("raw_geometry", "scaled_geometry")
+        "raw_geometry_pred", "scaled_geometry_pred", "fixed_geometry_pred",
+        *[f"{prefix}_{key}" for prefix in
+          ("raw_geometry", "scaled_geometry", "fixed_geometry")
           for key in ("ran", "success", "vetoed", "geometry_p1", "floor_inlier_ratio")],
-        "raw_geometry_error", "scaled_geometry_error",
+        "raw_geometry_error", "scaled_geometry_error", "fixed_geometry_error",
     ]
     prediction_path = output_dir / "da2_geometry_scale_predictions.csv"
     with prediction_path.open("w", newline="", encoding="utf-8") as stream:
@@ -428,18 +448,29 @@ def main() -> int:
     scaled_pred = np.asarray(
         [row["scaled_geometry_pred"] for row in predictions], dtype=np.float64
     )
+    fixed_pred = np.asarray(
+        [row["fixed_geometry_pred"] for row in predictions], dtype=np.float64
+    )
     variants = {
         "scalar_only": _metric_pair(gt, scalar_pred),
         "scalar_plus_raw_geometry": _metric_pair(gt, raw_pred),
         "scalar_plus_scaled_geometry": _metric_pair(gt, scaled_pred),
+        "scalar_plus_fixed_scaled_geometry": _metric_pair(gt, fixed_pred),
     }
     for name, target in (("scalar_plus_raw_geometry", raw_pred),
-                         ("scalar_plus_scaled_geometry", scaled_pred)):
+                         ("scalar_plus_scaled_geometry", scaled_pred),
+                         ("scalar_plus_fixed_scaled_geometry", fixed_pred)):
         variants[name]["changes_from_scalar_only"] = _transition_pair(
             gt, scalar_pred, target
         )
     variants["scalar_plus_scaled_geometry"]["changes_from_raw_geometry"] = _transition_pair(
         gt, raw_pred, scaled_pred
+    )
+    variants["scalar_plus_fixed_scaled_geometry"]["changes_from_raw_geometry"] = (
+        _transition_pair(gt, raw_pred, fixed_pred)
+    )
+    variants["scalar_plus_fixed_scaled_geometry"]["changes_from_loso_scaled_geometry"] = (
+        _transition_pair(gt, scaled_pred, fixed_pred)
     )
 
     for holdout in SEQUENCES:
@@ -452,10 +483,14 @@ def main() -> int:
         fold_scaled = np.asarray(
             [row["scaled_geometry_pred"] for row in fold_rows], dtype=np.float64
         )
+        fold_fixed = np.asarray(
+            [row["fixed_geometry_pred"] for row in fold_rows], dtype=np.float64
+        )
         folds[holdout]["metrics"] = {
             "scalar_only": _metric_pair(fold_gt, fold_scalar),
             "scalar_plus_raw_geometry": _metric_pair(fold_gt, fold_raw),
             "scalar_plus_scaled_geometry": _metric_pair(fold_gt, fold_scaled),
+            "scalar_plus_fixed_scaled_geometry": _metric_pair(fold_gt, fold_fixed),
         }
         folds[holdout]["changes"] = {
             "raw_geometry_from_scalar_only": _transition_pair(
@@ -467,10 +502,20 @@ def main() -> int:
             "scaled_geometry_from_raw_geometry": _transition_pair(
                 fold_gt, fold_raw, fold_scaled
             ),
+            "fixed_geometry_from_scalar_only": _transition_pair(
+                fold_gt, fold_scalar, fold_fixed
+            ),
+            "fixed_geometry_from_raw_geometry": _transition_pair(
+                fold_gt, fold_raw, fold_fixed
+            ),
+            "fixed_geometry_from_loso_scaled_geometry": _transition_pair(
+                fold_gt, fold_scaled, fold_fixed
+            ),
         }
         folds[holdout]["geometry_diagnostics"] = {
             "raw_geometry": _geometry_summary(fold_rows, "raw_geometry"),
             "scaled_geometry": _geometry_summary(fold_rows, "scaled_geometry"),
+            "fixed_geometry": _geometry_summary(fold_rows, "fixed_geometry"),
         }
 
     raw_success = [row for row in predictions if row["raw_geometry_success"]]
@@ -543,7 +588,19 @@ def main() -> int:
             "low_veto_floor_inlier_ratio": 0.80,
             "low_veto_gap_m": 0.26,
         },
-        "geometry_input_variants": ["raw_depth", "loso_global_scale_a_times_raw_depth"],
+        "geometry_input_variants": [
+            "raw_depth", "loso_global_scale_a_times_raw_depth",
+            "fixed_geometry_scale_times_raw_depth",
+        ],
+        "fixed_geometry_scale": args.fixed_geometry_scale,
+        "fixed_scale_provenance": (
+            "fitted from dense GT using all four sequences in TUM1100"
+        ),
+        "fixed_scale_evaluation_warning": (
+            "Fixed-scale metrics on TUM1100 are deployment sanity only, not a strict "
+            "held-out generalization estimate. The strict generalization result remains "
+            "LOSO scaled Geometry F1 = 0.854701."
+        ),
         "threshold_rule": "gt_distance < 2.0; pred_distance < 2.0",
         "boundary_subset": "1.5 <= gt_distance <= 2.5",
         "depth_scale": args.depth_scale,
@@ -557,6 +614,7 @@ def main() -> int:
         "aggregate_geometry_diagnostics": {
             "raw_geometry": _geometry_summary(predictions, "raw_geometry"),
             "scaled_geometry": _geometry_summary(predictions, "scaled_geometry"),
+            "fixed_geometry": _geometry_summary(predictions, "fixed_geometry"),
         },
         "raw_vs_scaled_geometry_feature_diagnostic": feature_diagnostic,
     }
