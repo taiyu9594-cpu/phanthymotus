@@ -106,6 +106,14 @@ GEOMETRY_VETO_P1 = 1.80
 GEOMETRY_VETO_FLOOR_INLIER_RATIO = 0.985
 GEOMETRY_VETO_DISTANCE = 2.01
 
+
+def _validated_geometry_depth_scale(indoor_cfg: dict) -> float:
+    scale = float(indoor_cfg.get("geometry_depth_scale", 1.0))
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("indoor.geometry_depth_scale must be finite and > 0")
+    return scale
+
+
 # 室外（yolo26n depth+seg 管线）
 OUT_ALLOWED_IDS = {0, 1, 2, 3, 5, 7}  # person, bicycle, car, motorcycle, bus, truck
 MASK_CONF_FLOOR = 0.05
@@ -397,6 +405,7 @@ class ObstaclePlugin:
         self._rescue_upper_bound = float(_ind.get("rescue_upper_bound_m", RESCUE_UPPER_BOUND))
         self._rescue_gap_threshold = float(_ind.get("rescue_gap_threshold_m", RESCUE_GAP_THRESHOLD))
         self._rescue_distance = float(_ind.get("rescue_distance_m", RESCUE_DISTANCE))
+        self._geometry_depth_scale = _validated_geometry_depth_scale(_ind)
         self._nodes: dict[str, _ObstacleDistanceNode] = {}
         self._indoor_eng: Optional[_TrtEngine] = None
         self._out_depth_eng: Optional[_TrtEngine] = None
@@ -673,7 +682,8 @@ class ObstaclePlugin:
             geometry_ran = True
             geometry_t0 = time.perf_counter()
             try:
-                geometry = self._indoor_geometry(depth_original)
+                geometry_depth = depth_original * np.float32(self._geometry_depth_scale)
+                geometry = self._indoor_geometry(geometry_depth)
                 if geometry is not None:
                     geometry_p1, floor_inlier_ratio = geometry
                     vetoed = (geometry_p1 >= GEOMETRY_VETO_P1 and
@@ -693,6 +703,7 @@ class ObstaclePlugin:
                  f"geometry_run={geometry_ran} "
                  f"geometry_p1={geometry_p1 if geometry_p1 is not None else 'n/a'} "
                  f"floor_inlier_ratio={floor_inlier_ratio if floor_inlier_ratio is not None else 'n/a'} "
+                 f"geometry_depth_scale={self._geometry_depth_scale:.9f} "
                  f"geometry_ms={geometry_ms:.1f} veto={vetoed} pred={pred:.3f}m")
         return pred, {"fallback": False}
 

@@ -36,6 +36,7 @@ plugins:
       rescue_upper_bound_m: 2.495905647277832
       rescue_gap_threshold_m: 0.35293271780014046
       rescue_distance_m: 1.99
+      geometry_depth_scale: 1.0797389789860306  # dimensionless; Geometry input only
     outdoor:
       depth_engine: yolo26n-depth_int8.trt
       seg_engine: yolo26n-seg_fp16.trt
