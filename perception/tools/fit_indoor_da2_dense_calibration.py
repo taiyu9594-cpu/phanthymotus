@@ -28,6 +28,11 @@ GT_RANGES = (
     ("all", None),
 )
 CALIBRATIONS = ("dense_scale", "dense_affine")
+NONLINEAR_RANGES = (("all", None), ("gt_le_5m", 5.0))
+NONLINEAR_WEIGHTINGS = ("pixel_equal", "frame_balanced")
+RAW_BIN_WIDTH_M = 0.05
+RAW_BIN_MAX_M = 100.0
+RAW_PROBES_M = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
 ROI_ROWS = (0, 300)
 ROI_COLS = (213, 426)
 PREPROCESSING = (
@@ -90,6 +95,60 @@ class DenseStats:
         return {"dense_pixel_count": self.n, "sum_pred": self.sum_x,
                 "sum_gt": self.sum_y, "sum_pred_squared": self.sum_x2,
                 "sum_pred_gt": self.sum_xy}
+
+
+@dataclass
+class BinnedStats:
+    pixel_count: np.ndarray
+    pixel_sum_raw: np.ndarray
+    pixel_sum_gt: np.ndarray
+    frame_weight: np.ndarray
+    frame_weighted_sum_raw: np.ndarray
+    frame_weighted_sum_gt: np.ndarray
+    frame_count: int = 0
+    valid_pixel_count: int = 0
+    overflow_pixel_count: int = 0
+
+    @classmethod
+    def empty(cls) -> "BinnedStats":
+        size = int(math.ceil(RAW_BIN_MAX_M / RAW_BIN_WIDTH_M)) + 1
+        return cls(
+            np.zeros(size, dtype=np.int64),
+            np.zeros(size, dtype=np.float64),
+            np.zeros(size, dtype=np.float64),
+            np.zeros(size, dtype=np.float64),
+            np.zeros(size, dtype=np.float64),
+            np.zeros(size, dtype=np.float64),
+        )
+
+    def add_frame(self, raw: np.ndarray, gt: np.ndarray) -> None:
+        x = np.asarray(raw, dtype=np.float64)
+        y = np.asarray(gt, dtype=np.float64)
+        if x.size == 0:
+            return
+        last = self.pixel_count.size - 1
+        indices = np.minimum((x / RAW_BIN_WIDTH_M).astype(np.int64), last)
+        counts = np.bincount(indices, minlength=self.pixel_count.size)
+        sum_raw = np.bincount(indices, weights=x, minlength=self.pixel_count.size)
+        sum_gt = np.bincount(indices, weights=y, minlength=self.pixel_count.size)
+        self.pixel_count += counts
+        self.pixel_sum_raw += sum_raw
+        self.pixel_sum_gt += sum_gt
+        inverse_frame_pixels = 1.0 / float(x.size)
+        self.frame_weight += counts * inverse_frame_pixels
+        self.frame_weighted_sum_raw += sum_raw * inverse_frame_pixels
+        self.frame_weighted_sum_gt += sum_gt * inverse_frame_pixels
+        self.frame_count += 1
+        self.valid_pixel_count += int(x.size)
+        self.overflow_pixel_count += int(np.sum(x >= RAW_BIN_MAX_M))
+
+    def summary(self) -> dict[str, int]:
+        return {
+            "frame_count": self.frame_count,
+            "valid_pixel_count": self.valid_pixel_count,
+            "occupied_bin_count": int(np.count_nonzero(self.pixel_count)),
+            "overflow_pixel_count": self.overflow_pixel_count,
+        }
 
 
 def _parse_args() -> argparse.Namespace:
@@ -318,6 +377,93 @@ def _fit_affine(stats: DenseStats) -> tuple[float, float]:
     return slope, intercept
 
 
+def _weighted_pava(y: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    block_start: list[int] = []
+    block_end: list[int] = []
+    block_weight: list[float] = []
+    block_value: list[float] = []
+    for index, (value, weight) in enumerate(zip(y, weights)):
+        if not math.isfinite(float(value)) or not math.isfinite(float(weight)) or weight <= 0.0:
+            raise ValueError("weighted PAVA requires finite values and positive weights")
+        block_start.append(index)
+        block_end.append(index)
+        block_weight.append(float(weight))
+        block_value.append(float(value))
+        while len(block_value) >= 2 and block_value[-2] > block_value[-1]:
+            combined_weight = block_weight[-2] + block_weight[-1]
+            combined_value = (
+                block_value[-2] * block_weight[-2]
+                + block_value[-1] * block_weight[-1]
+            ) / combined_weight
+            block_end[-2] = block_end[-1]
+            block_weight[-2] = combined_weight
+            block_value[-2] = combined_value
+            block_start.pop()
+            block_end.pop()
+            block_weight.pop()
+            block_value.pop()
+    fitted = np.empty_like(y, dtype=np.float64)
+    for start, end, value in zip(block_start, block_end, block_value):
+        fitted[start:end + 1] = value
+    return fitted
+
+
+def _fit_binned_isotonic(
+    sequence_stats: dict[str, BinnedStats], train_sequences: Sequence[str], weighting: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    size = next(iter(sequence_stats.values())).pixel_count.size
+    total_weight = np.zeros(size, dtype=np.float64)
+    weighted_sum_raw = np.zeros(size, dtype=np.float64)
+    weighted_sum_gt = np.zeros(size, dtype=np.float64)
+    sequence_input_weights = {}
+    for sequence in train_sequences:
+        stats = sequence_stats[sequence]
+        if weighting == "pixel_equal":
+            denominator = float(stats.valid_pixel_count)
+            weights = stats.pixel_count.astype(np.float64)
+            sum_raw = stats.pixel_sum_raw
+            sum_gt = stats.pixel_sum_gt
+        elif weighting == "frame_balanced":
+            denominator = float(stats.frame_count)
+            weights = stats.frame_weight
+            sum_raw = stats.frame_weighted_sum_raw
+            sum_gt = stats.frame_weighted_sum_gt
+        else:
+            raise ValueError(f"unsupported nonlinear weighting: {weighting}")
+        if denominator <= 0.0:
+            raise ValueError(f"no nonlinear fitting data for sequence {sequence}")
+        # Normalize each training sequence to total weight one. Pixel-equal keeps
+        # pixels equal within a sequence; frame-balanced additionally gives every
+        # frame equal total weight within its sequence.
+        total_weight += weights / denominator
+        weighted_sum_raw += sum_raw / denominator
+        weighted_sum_gt += sum_gt / denominator
+        sequence_input_weights[sequence] = float(np.sum(weights / denominator))
+    occupied = total_weight > 0.0
+    if np.count_nonzero(occupied) < 2:
+        raise ValueError("isotonic calibration requires at least two occupied raw-depth bins")
+    x_knots = weighted_sum_raw[occupied] / total_weight[occupied]
+    bin_gt_means = weighted_sum_gt[occupied] / total_weight[occupied]
+    y_knots = _weighted_pava(bin_gt_means, total_weight[occupied])
+    if np.any(np.diff(x_knots) <= 0.0) or np.any(np.diff(y_knots) < -1e-12):
+        raise RuntimeError("isotonic knots are not monotonic")
+    diagnostics: dict[str, object] = {
+        "sampled_dense_pixel_count": int(sum(
+            sequence_stats[sequence].valid_pixel_count for sequence in train_sequences
+        )),
+        "occupied_bin_count": int(x_knots.size),
+        "sequence_normalized_input_weights": sequence_input_weights,
+        "raw_depth_range_m": [float(x_knots[0]), float(x_knots[-1])],
+        "calibrated_depth_range_m": [float(y_knots[0]), float(y_knots[-1])],
+    }
+    return x_knots, y_knots, diagnostics
+
+
+def _nonlinear_name(range_name: str, weighting: str) -> str:
+    prefix = "dense_isotonic" if range_name == "all" else "dense_isotonic_gt_le_5m"
+    return f"{prefix}_{weighting}"
+
+
 def _metrics(gt: np.ndarray, pred: np.ndarray) -> dict[str, int | float | None]:
     if gt.size == 0:
         return {"count": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0,
@@ -387,6 +533,24 @@ def _candidate_result(
     }
 
 
+def _named_candidate_result(
+    predictions: Sequence[dict[str, object]], candidate: str, feature: str,
+) -> dict[str, object]:
+    gt = np.asarray([row["gt_distance"] for row in predictions], dtype=np.float64)
+    raw = np.asarray([row[f"raw_{feature}"] for row in predictions], dtype=np.float64)
+    calibrated = np.asarray(
+        [row[f"{candidate}:{feature}"] for row in predictions], dtype=np.float64
+    )
+    boundary = (gt >= 1.5) & (gt <= 2.5)
+    return {
+        "metrics": _metric_pair(gt, calibrated),
+        "changes_from_raw": _transitions(gt, raw, calibrated),
+        "boundary_changes_from_raw": _transitions(
+            gt[boundary], raw[boundary], calibrated[boundary]
+        ),
+    }
+
+
 def _selection_key(candidate: dict[str, object], boundary: bool) -> tuple[float, float, float]:
     subset = "boundary_1p5_to_2p5" if boundary else "all"
     metrics = candidate["result"]["metrics"][subset]  # type: ignore[index]
@@ -396,6 +560,11 @@ def _selection_key(candidate: dict[str, object], boundary: bool) -> tuple[float,
 
 
 def _synthetic_self_test() -> int:
+    pooled = _weighted_pava(
+        np.asarray([1.0, 3.0, 2.0, 4.0]), np.ones(4, dtype=np.float64)
+    )
+    if not np.allclose(pooled, np.asarray([1.0, 2.5, 2.5, 4.0])):
+        raise AssertionError(f"weighted PAVA pooling failed: {pooled}")
     pred = np.asarray([0.5, 1.0, 2.0, 4.0], dtype=np.float64)
     gt = 1.25 * pred
     stats = DenseStats()
@@ -408,8 +577,31 @@ def _synthetic_self_test() -> int:
         raise AssertionError(f"expected affine a 1.25, got {affine_a}")
     if not math.isclose(affine_b, 0.0, rel_tol=0.0, abs_tol=1e-12):
         raise AssertionError(f"expected affine b 0, got {affine_b}")
+    nonlinear_stats = {sequence: BinnedStats.empty() for sequence in SEQUENCES[:3]}
+    nonlinear_raw = np.linspace(0.1, 6.0, 2000, dtype=np.float64)
+    nonlinear_gt = nonlinear_raw + 0.08 * np.square(nonlinear_raw)
+    for sequence, splits in zip(SEQUENCES[:3], (4, 5, 7)):
+        for raw_frame, gt_frame in zip(
+            np.array_split(nonlinear_raw, splits), np.array_split(nonlinear_gt, splits)
+        ):
+            nonlinear_stats[sequence].add_frame(raw_frame, gt_frame)
+    nonlinear_errors = {}
+    for weighting in NONLINEAR_WEIGHTINGS:
+        x_knots, y_knots, _ = _fit_binned_isotonic(
+            nonlinear_stats, SEQUENCES[:3], weighting
+        )
+        probes = np.asarray(RAW_PROBES_M, dtype=np.float64)
+        expected = probes + 0.08 * np.square(probes)
+        learned = np.interp(probes, x_knots, y_knots)
+        error = float(np.max(np.abs(learned - expected)))
+        if error > 0.02:
+            raise AssertionError(
+                f"nonlinear {weighting} max probe error {error} exceeds 0.02m"
+            )
+        nonlinear_errors[weighting] = error
     print(f"synthetic_self_test=PASS scale={scale:.12f} "
-          f"affine_a={affine_a:.12f} affine_b={affine_b:.12f}")
+          f"affine_a={affine_a:.12f} affine_b={affine_b:.12f} "
+          f"nonlinear_max_errors={json.dumps(nonlinear_errors, sort_keys=True)}")
     return 0
 
 
@@ -433,6 +625,10 @@ def main() -> int:
         range_name: {sequence: DenseStats() for sequence in SEQUENCES}
         for range_name, _ in GT_RANGES
     }
+    nonlinear_stats_by_range = {
+        range_name: {sequence: BinnedStats.empty() for sequence in SEQUENCES}
+        for range_name, _ in NONLINEAR_RANGES
+    }
     matched = [item for item in alignments if item.matched]
     try:
         first_bgr = _read_rgb(rows[0].image_path, cv2)
@@ -455,6 +651,12 @@ def main() -> int:
                     sequence_stats_by_range[range_name][item.row.sequence].add_arrays(
                         range_pred, range_gt
                     )
+            for range_name, upper_bound in NONLINEAR_RANGES:
+                selected = (np.ones(gt_values.shape, dtype=bool) if upper_bound is None
+                            else gt_values <= upper_bound)
+                nonlinear_stats_by_range[range_name][item.row.sequence].add_frame(
+                    pred_values[selected], gt_values[selected]
+                )
             print(f"dense_fit [{index}/{len(matched)}] {item.row.sequence}:"
                   f"{item.row.source_index} pixels={json.dumps(range_counts, sort_keys=True)}",
                   flush=True)
@@ -487,6 +689,52 @@ def main() -> int:
                 })
             folds_by_range[range_name] = range_folds
 
+        nonlinear_folds: dict[str, dict[str, list[dict[str, object]]]] = {
+            range_name: {weighting: [] for weighting in NONLINEAR_WEIGHTINGS}
+            for range_name, _ in NONLINEAR_RANGES
+        }
+        nonlinear_mappings: dict[
+            str, dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]
+        ] = {
+            range_name: {weighting: {} for weighting in NONLINEAR_WEIGHTINGS}
+            for range_name, _ in NONLINEAR_RANGES
+        }
+        for range_name, upper_bound in NONLINEAR_RANGES:
+            for weighting in NONLINEAR_WEIGHTINGS:
+                for holdout in SEQUENCES:
+                    train_sequences = [sequence for sequence in SEQUENCES if sequence != holdout]
+                    x_knots, y_knots, diagnostics = _fit_binned_isotonic(
+                        nonlinear_stats_by_range[range_name], train_sequences, weighting
+                    )
+                    nonlinear_mappings[range_name][weighting][holdout] = (x_knots, y_knots)
+                    probes = np.asarray(RAW_PROBES_M, dtype=np.float64)
+                    probe_values = np.interp(probes, x_knots, y_knots)
+                    fold = {
+                        "gt_range": range_name,
+                        "fit_gt_depth_upper_bound_m": upper_bound,
+                        "weighting": weighting,
+                        "candidate": _nonlinear_name(range_name, weighting),
+                        "holdout_sequence": holdout,
+                        "train_sequences": train_sequences,
+                        **diagnostics,
+                        "number_of_knots": int(x_knots.size),
+                        "x_knots": x_knots.tolist(),
+                        "y_knots": y_knots.tolist(),
+                        "fixed_raw_depth_probes_m": {
+                            f"{probe:g}": float(value)
+                            for probe, value in zip(probes, probe_values)
+                        },
+                    }
+                    nonlinear_folds[range_name][weighting].append(fold)
+                    print(
+                        f"nonlinear_fold holdout={holdout} train={train_sequences} "
+                        f"range={range_name} weighting={weighting} "
+                        f"pixels={diagnostics['sampled_dense_pixel_count']} "
+                        f"bins={diagnostics['occupied_bin_count']} knots={x_knots.size} "
+                        f"probes={json.dumps(fold['fixed_raw_depth_probes_m'], sort_keys=True)}",
+                        flush=True,
+                    )
+
         predictions: list[dict[str, object]] = []
         for index, row in enumerate(rows, start=1):
             raw = infer_da2(engine, _read_rgb(row.image_path, cv2))
@@ -510,6 +758,15 @@ def main() -> int:
                     output.update({
                         f"{range_name}:{calibration}:{name}": value
                         for name, value in calibrated_features.items()
+                    })
+            for range_name, _ in NONLINEAR_RANGES:
+                for weighting in NONLINEAR_WEIGHTINGS:
+                    x_knots, y_knots = nonlinear_mappings[range_name][weighting][row.sequence]
+                    calibrated = np.interp(raw, x_knots, y_knots)
+                    candidate = _nonlinear_name(range_name, weighting)
+                    output.update({
+                        f"{candidate}:{name}": value
+                        for name, value in _features(calibrated).items()
                     })
             all_parameters = parameters["all"][row.sequence]
             output["scale_a"] = all_parameters["scale_a"]
@@ -543,6 +800,17 @@ def main() -> int:
             if range_name == "all":
                 fold["scaled_metrics"] = {
                     feature: fold["calibrated_results"]["dense_scale"][feature]["metrics"]
+                    for feature in FEATURES
+                }
+
+    for range_name, _ in NONLINEAR_RANGES:
+        for weighting in NONLINEAR_WEIGHTINGS:
+            candidate = _nonlinear_name(range_name, weighting)
+            for fold in nonlinear_folds[range_name][weighting]:
+                fold_rows = [row for row in predictions
+                             if row["sequence"] == fold["holdout_sequence"]]
+                fold["results"] = {
+                    feature: _named_candidate_result(fold_rows, candidate, feature)
                     for feature in FEATURES
                 }
 
@@ -657,8 +925,111 @@ def main() -> int:
         json.dump(near_report, stream, indent=2, allow_nan=False)
         stream.write("\n")
 
+    nonlinear_candidates = []
+    nonlinear_aggregate: dict[str, dict[str, object]] = {}
+    gt_all = np.asarray([row["gt_distance"] for row in predictions], dtype=np.float64)
+    boundary_all = (gt_all >= 1.5) & (gt_all <= 2.5)
+    raw_results = {}
+    global_scale_results = {}
+    for feature in FEATURES:
+        raw_values = np.asarray(
+            [row[f"raw_{feature}"] for row in predictions], dtype=np.float64
+        )
+        raw_result = {
+            "metrics": _metric_pair(gt_all, raw_values),
+            "changes_from_raw": _transitions(gt_all, raw_values, raw_values),
+            "boundary_changes_from_raw": _transitions(
+                gt_all[boundary_all], raw_values[boundary_all], raw_values[boundary_all]
+            ),
+        }
+        raw_results[feature] = raw_result
+        nonlinear_candidates.append({
+            "candidate": "raw", "feature": feature, "result": raw_result,
+        })
+        scale_result = _candidate_result(
+            predictions, "all", "dense_scale", feature
+        )
+        global_scale_results[feature] = scale_result
+        nonlinear_candidates.append({
+            "candidate": "global_dense_scale", "feature": feature,
+            "result": scale_result,
+        })
+    nonlinear_aggregate["raw"] = raw_results
+    nonlinear_aggregate["global_dense_scale"] = global_scale_results
+    for range_name, _ in NONLINEAR_RANGES:
+        for weighting in NONLINEAR_WEIGHTINGS:
+            candidate = _nonlinear_name(range_name, weighting)
+            candidate_results = {
+                feature: _named_candidate_result(predictions, candidate, feature)
+                for feature in FEATURES
+            }
+            nonlinear_aggregate[candidate] = candidate_results
+            for feature, result in candidate_results.items():
+                nonlinear_candidates.append({
+                    "candidate": candidate, "gt_range": range_name,
+                    "weighting": weighting, "feature": feature, "result": result,
+                })
+    nonlinear_best_overall = max(
+        nonlinear_candidates, key=lambda candidate: _selection_key(candidate, False)
+    )
+    nonlinear_best_boundary = max(
+        nonlinear_candidates, key=lambda candidate: _selection_key(candidate, True)
+    )
+    nonlinear_report = {
+        "experiment_type": "da2_dense_nonlinear_isotonic_strict_loso",
+        "trt_engine_path": str(engine_path),
+        "trt_engine_sha256": _sha256(engine_path),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": _sha256(manifest_path),
+        "depth_scale": args.depth_scale,
+        "max_timestamp_delta_sec": args.max_timestamp_delta,
+        "roi_rows": list(ROI_ROWS), "roi_cols": list(ROI_COLS),
+        "preprocessing": PREPROCESSING,
+        "mapping": "weighted PAVA; D_cal = interp(D_raw, x_knots, y_knots)",
+        "fixed_raw_bin_width_m": RAW_BIN_WIDTH_M,
+        "fixed_raw_bin_max_m": RAW_BIN_MAX_M,
+        "fixed_raw_depth_probes_m": list(RAW_PROBES_M),
+        "fit_scopes": [
+            {"name": range_name, "gt_depth_upper_bound_m": upper_bound}
+            for range_name, upper_bound in NONLINEAR_RANGES
+        ],
+        "weightings": {
+            "pixel_equal": (
+                "pixels equal within each sequence; each train sequence normalized "
+                "to total weight one"
+            ),
+            "frame_balanced": (
+                "pixels normalized to total weight one per frame, then frames normalized "
+                "within sequence and each train sequence to total weight one"
+            ),
+        },
+        "holdout_evaluation_scope": "all frames in each complete held-out sequence",
+        "threshold_rule": "gt_distance < 2.0; pred_distance < 2.0",
+        "boundary_subset": "1.5 <= gt_distance <= 2.5",
+        "alignment": near_report["alignment"],
+        "sequence_binned_statistics": {
+            range_name: {
+                sequence: nonlinear_stats_by_range[range_name][sequence].summary()
+                for sequence in SEQUENCES
+            } for range_name, _ in NONLINEAR_RANGES
+        },
+        "folds": nonlinear_folds,
+        "aggregate_out_of_fold_results": nonlinear_aggregate,
+        "best_overall": nonlinear_best_overall,
+        "best_boundary": nonlinear_best_boundary,
+        "selection_policy": (
+            "best_overall includes raw and global dense scale baselines and uses complete "
+            "held-out aggregate F1, then MAE/RMSE; best_boundary is diagnostic only"
+        ),
+    }
+    nonlinear_report_path = output_dir / "da2_dense_nonlinear_calibration_report.json"
+    with nonlinear_report_path.open("w", encoding="utf-8") as stream:
+        json.dump(nonlinear_report, stream, indent=2, allow_nan=False)
+        stream.write("\n")
+
     print(f"report={report_path}")
     print(f"near_report={near_report_path}")
+    print(f"nonlinear_report={nonlinear_report_path}")
     print(f"predictions={prediction_path}")
     print(f"alignment={alignment_path}")
     return 0
