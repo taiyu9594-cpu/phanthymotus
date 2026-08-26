@@ -20,6 +20,14 @@ import numpy as np
 
 SEQUENCES = ("slam1", "slam2", "slam3", "pioneer_360")
 FEATURES = ("min", "p1", "p5", "p10")
+GT_RANGES = (
+    ("gt_le_2p5", 2.5),
+    ("gt_le_3p0", 3.0),
+    ("gt_le_4p0", 4.0),
+    ("gt_le_5p0", 5.0),
+    ("all", None),
+)
+CALIBRATIONS = ("dense_scale", "dense_affine")
 ROI_ROWS = (0, 300)
 ROI_COLS = (213, 426)
 PREPROCESSING = (
@@ -57,6 +65,8 @@ class DepthIndex:
 @dataclass
 class DenseStats:
     n: int = 0
+    sum_x: float = 0.0
+    sum_y: float = 0.0
     sum_x2: float = 0.0
     sum_xy: float = 0.0
 
@@ -64,16 +74,21 @@ class DenseStats:
         x = np.asarray(pred, dtype=np.float64)
         y = np.asarray(gt, dtype=np.float64)
         self.n += int(x.size)
+        self.sum_x += float(np.sum(x, dtype=np.float64))
+        self.sum_y += float(np.sum(y, dtype=np.float64))
         self.sum_x2 += float(np.dot(x, x))
         self.sum_xy += float(np.dot(x, y))
 
     def add_stats(self, other: "DenseStats") -> None:
         self.n += other.n
+        self.sum_x += other.sum_x
+        self.sum_y += other.sum_y
         self.sum_x2 += other.sum_x2
         self.sum_xy += other.sum_xy
 
     def as_dict(self) -> dict[str, int | float]:
-        return {"dense_pixel_count": self.n, "sum_pred_squared": self.sum_x2,
+        return {"dense_pixel_count": self.n, "sum_pred": self.sum_x,
+                "sum_gt": self.sum_y, "sum_pred_squared": self.sum_x2,
                 "sum_pred_gt": self.sum_xy}
 
 
@@ -222,7 +237,7 @@ def _write_alignment_report(path: Path, alignments: Sequence[Alignment]) -> None
     fields = ["sequence", "source_index", "image_path", "rgb_timestamp", "depth_txt",
               "depth_timestamp", "depth_path", "timestamp_delta", "matched", "failure"]
     with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for item in alignments:
             writer.writerow({
@@ -290,6 +305,19 @@ def _fit_scale(stats: DenseStats) -> float:
     return scale
 
 
+def _fit_affine(stats: DenseStats) -> tuple[float, float]:
+    if stats.n < 2:
+        raise ValueError("cannot fit dense affine without at least two valid pixel pairs")
+    denominator = stats.n * stats.sum_x2 - stats.sum_x * stats.sum_x
+    if not math.isfinite(denominator) or denominator <= 0.0:
+        raise ValueError(f"invalid dense affine denominator: {denominator}")
+    slope = (stats.n * stats.sum_xy - stats.sum_x * stats.sum_y) / denominator
+    intercept = (stats.sum_y - slope * stats.sum_x) / stats.n
+    if not math.isfinite(slope) or not math.isfinite(intercept) or slope <= 0.0:
+        raise ValueError(f"invalid dense affine parameters: a={slope} b={intercept}")
+    return slope, intercept
+
+
 def _metrics(gt: np.ndarray, pred: np.ndarray) -> dict[str, int | float | None]:
     if gt.size == 0:
         return {"count": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0,
@@ -327,6 +355,46 @@ def _calculate_metrics(predictions: Sequence[dict[str, object]]) -> dict[str, ob
     return result
 
 
+def _transitions(gt: np.ndarray, raw: np.ndarray, calibrated: np.ndarray) -> dict[str, int]:
+    actual = gt < 2.0
+    raw_positive = raw < 2.0
+    calibrated_positive = calibrated < 2.0
+    return {
+        "fp_to_tn": int(np.sum(~actual & raw_positive & ~calibrated_positive)),
+        "tp_to_fn": int(np.sum(actual & raw_positive & ~calibrated_positive)),
+        "fn_to_tp": int(np.sum(actual & ~raw_positive & calibrated_positive)),
+        "tn_to_fp": int(np.sum(~actual & ~raw_positive & calibrated_positive)),
+    }
+
+
+def _candidate_result(
+    predictions: Sequence[dict[str, object]], range_name: str,
+    calibration: str, feature: str,
+) -> dict[str, object]:
+    gt = np.asarray([row["gt_distance"] for row in predictions], dtype=np.float64)
+    raw = np.asarray([row[f"raw_{feature}"] for row in predictions], dtype=np.float64)
+    calibrated = np.asarray(
+        [row[f"{range_name}:{calibration}:{feature}"] for row in predictions],
+        dtype=np.float64,
+    )
+    boundary = (gt >= 1.5) & (gt <= 2.5)
+    return {
+        "metrics": _metric_pair(gt, calibrated),
+        "changes_from_raw": _transitions(gt, raw, calibrated),
+        "boundary_changes_from_raw": _transitions(
+            gt[boundary], raw[boundary], calibrated[boundary]
+        ),
+    }
+
+
+def _selection_key(candidate: dict[str, object], boundary: bool) -> tuple[float, float, float]:
+    subset = "boundary_1p5_to_2p5" if boundary else "all"
+    metrics = candidate["result"]["metrics"][subset]  # type: ignore[index]
+    mae = float(metrics["mae"]) if metrics["mae"] is not None else math.inf
+    rmse = float(metrics["rmse"]) if metrics["rmse"] is not None else math.inf
+    return float(metrics["f1"]), -mae, -rmse
+
+
 def _synthetic_self_test() -> int:
     pred = np.asarray([0.5, 1.0, 2.0, 4.0], dtype=np.float64)
     gt = 1.25 * pred
@@ -335,7 +403,13 @@ def _synthetic_self_test() -> int:
     scale = _fit_scale(stats)
     if not math.isclose(scale, 1.25, rel_tol=0.0, abs_tol=1e-12):
         raise AssertionError(f"expected scale 1.25, got {scale}")
-    print(f"synthetic_self_test=PASS scale={scale:.12f}")
+    affine_a, affine_b = _fit_affine(stats)
+    if not math.isclose(affine_a, 1.25, rel_tol=0.0, abs_tol=1e-12):
+        raise AssertionError(f"expected affine a 1.25, got {affine_a}")
+    if not math.isclose(affine_b, 0.0, rel_tol=0.0, abs_tol=1e-12):
+        raise AssertionError(f"expected affine b 0, got {affine_b}")
+    print(f"synthetic_self_test=PASS scale={scale:.12f} "
+          f"affine_a={affine_a:.12f} affine_b={affine_b:.12f}")
     return 0
 
 
@@ -355,7 +429,10 @@ def main() -> int:
 
     engine_type, infer_da2, cv2 = _load_da2_helpers()
     engine = engine_type(str(engine_path))
-    sequence_stats = {sequence: DenseStats() for sequence in SEQUENCES}
+    sequence_stats_by_range = {
+        range_name: {sequence: DenseStats() for sequence in SEQUENCES}
+        for range_name, _ in GT_RANGES
+    }
     matched = [item for item in alignments if item.matched]
     try:
         first_bgr = _read_rgb(rows[0].image_path, cv2)
@@ -367,55 +444,109 @@ def main() -> int:
             raw = infer_da2(engine, _read_rgb(item.row.image_path, cv2))
             gt = _read_tum_depth(item.depth_path, args.depth_scale, cv2)
             pred_values, gt_values = _valid_dense_pairs(raw, gt)
-            sequence_stats[item.row.sequence].add_arrays(pred_values, gt_values)
+            range_counts = {}
+            for range_name, upper_bound in GT_RANGES:
+                selected = (np.ones(gt_values.shape, dtype=bool) if upper_bound is None
+                            else gt_values <= upper_bound)
+                range_pred = pred_values[selected]
+                range_gt = gt_values[selected]
+                range_counts[range_name] = int(range_pred.size)
+                if range_pred.size:
+                    sequence_stats_by_range[range_name][item.row.sequence].add_arrays(
+                        range_pred, range_gt
+                    )
             print(f"dense_fit [{index}/{len(matched)}] {item.row.sequence}:"
-                  f"{item.row.source_index} pixels={pred_values.size}", flush=True)
+                  f"{item.row.source_index} pixels={json.dumps(range_counts, sort_keys=True)}",
+                  flush=True)
 
-        folds: list[dict[str, object]] = []
-        scale_by_holdout: dict[str, float] = {}
-        for holdout in SEQUENCES:
-            train_sequences = [sequence for sequence in SEQUENCES if sequence != holdout]
-            train_stats = DenseStats()
-            for sequence in train_sequences:
-                train_stats.add_stats(sequence_stats[sequence])
-            scale = _fit_scale(train_stats)
-            scale_by_holdout[holdout] = scale
-            folds.append({
-                "train_sequences": train_sequences, "holdout_sequence": holdout,
-                "dense_pixel_count": train_stats.n,
-                "train_dense_pixel_count": train_stats.n,
-                "holdout_dense_pixel_count": sequence_stats[holdout].n,
-                "scale_a": scale,
-                "train_sufficient_statistics": train_stats.as_dict(),
-            })
+        folds_by_range: dict[str, list[dict[str, object]]] = {}
+        parameters: dict[str, dict[str, dict[str, float]]] = {}
+        for range_name, upper_bound in GT_RANGES:
+            range_folds = []
+            parameters[range_name] = {}
+            for holdout in SEQUENCES:
+                train_sequences = [sequence for sequence in SEQUENCES if sequence != holdout]
+                train_stats = DenseStats()
+                for sequence in train_sequences:
+                    train_stats.add_stats(sequence_stats_by_range[range_name][sequence])
+                scale_a = _fit_scale(train_stats)
+                affine_a, affine_b = _fit_affine(train_stats)
+                parameters[range_name][holdout] = {
+                    "scale_a": scale_a, "affine_a": affine_a, "affine_b": affine_b,
+                }
+                range_folds.append({
+                    "gt_range": range_name,
+                    "fit_gt_depth_upper_bound_m": upper_bound,
+                    "train_sequences": train_sequences,
+                    "holdout_sequence": holdout,
+                    "train_dense_pixel_count": train_stats.n,
+                    "holdout_dense_pixel_count":
+                        sequence_stats_by_range[range_name][holdout].n,
+                    "scale_a": scale_a, "affine_a": affine_a, "affine_b": affine_b,
+                    "train_sufficient_statistics": train_stats.as_dict(),
+                })
+            folds_by_range[range_name] = range_folds
 
         predictions: list[dict[str, object]] = []
         for index, row in enumerate(rows, start=1):
             raw = infer_da2(engine, _read_rgb(row.image_path, cv2))
-            scale = scale_by_holdout[row.sequence]
-            calibrated = scale * raw
             raw_features = _features(raw)
-            scaled_features = _features(calibrated)
             output: dict[str, object] = {
                 "holdout_sequence": row.sequence, "sequence": row.sequence,
                 "source_index": row.source_index, "image_path": str(row.image_path),
-                "gt_distance": row.gt_distance, "scale_a": scale,
+                "gt_distance": row.gt_distance,
             }
             output.update({f"raw_{name}": value for name, value in raw_features.items()})
-            output.update({f"dense_scale_{name}": value
-                           for name, value in scaled_features.items()})
+            for range_name, _ in GT_RANGES:
+                fold_parameters = parameters[range_name][row.sequence]
+                maps = {
+                    "dense_scale": fold_parameters["scale_a"] * raw,
+                    "dense_affine": (
+                        fold_parameters["affine_a"] * raw + fold_parameters["affine_b"]
+                    ),
+                }
+                for calibration, calibrated in maps.items():
+                    calibrated_features = _features(calibrated)
+                    output.update({
+                        f"{range_name}:{calibration}:{name}": value
+                        for name, value in calibrated_features.items()
+                    })
+            all_parameters = parameters["all"][row.sequence]
+            output["scale_a"] = all_parameters["scale_a"]
+            output.update({
+                f"dense_scale_{feature}": output[f"all:dense_scale:{feature}"]
+                for feature in FEATURES
+            })
             predictions.append(output)
             print(f"holdout_eval [{index}/{len(rows)}] {row.sequence}:{row.source_index}",
                   flush=True)
     finally:
         engine.close()
 
-    for fold in folds:
-        fold_rows = [row for row in predictions
-                     if row["sequence"] == fold["holdout_sequence"]]
-        fold_metrics = _calculate_metrics(fold_rows)
-        fold["raw_metrics"] = fold_metrics["raw"]
-        fold["scaled_metrics"] = fold_metrics["dense_scale"]
+    for range_name, _ in GT_RANGES:
+        for fold in folds_by_range[range_name]:
+            fold_rows = [row for row in predictions
+                         if row["sequence"] == fold["holdout_sequence"]]
+            fold["raw_metrics"] = {
+                feature: _metric_pair(
+                    np.asarray([row["gt_distance"] for row in fold_rows], dtype=np.float64),
+                    np.asarray([row[f"raw_{feature}"] for row in fold_rows], dtype=np.float64),
+                ) for feature in FEATURES
+            }
+            fold["calibrated_results"] = {
+                calibration: {
+                    feature: _candidate_result(
+                        fold_rows, range_name, calibration, feature
+                    ) for feature in FEATURES
+                } for calibration in CALIBRATIONS
+            }
+            if range_name == "all":
+                fold["scaled_metrics"] = {
+                    feature: fold["calibrated_results"]["dense_scale"][feature]["metrics"]
+                    for feature in FEATURES
+                }
+
+    folds = folds_by_range["all"]
 
     prediction_path = output_dir / "da2_dense_scale_predictions.csv"
     fields = ["holdout_sequence", "sequence", "source_index", "image_path",
@@ -423,7 +554,7 @@ def main() -> int:
               *[f"raw_{feature}" for feature in FEATURES],
               *[f"dense_scale_{feature}" for feature in FEATURES]]
     with prediction_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(predictions)
 
@@ -450,7 +581,8 @@ def main() -> int:
             "mean_matched_delta_sec": float(np.mean(matched_deltas)) if matched_deltas else None,
         },
         "sequence_dense_statistics": {
-            sequence: sequence_stats[sequence].as_dict() for sequence in SEQUENCES
+            sequence: sequence_stats_by_range["all"][sequence].as_dict()
+            for sequence in SEQUENCES
         },
         "folds": folds,
         "aggregate_out_of_fold_metrics": _calculate_metrics(predictions),
@@ -460,7 +592,73 @@ def main() -> int:
         json.dump(report, stream, indent=2, allow_nan=False)
         stream.write("\n")
 
+    candidates = []
+    aggregate_results: dict[str, dict[str, dict[str, object]]] = {}
+    for range_name, upper_bound in GT_RANGES:
+        aggregate_results[range_name] = {}
+        for calibration in CALIBRATIONS:
+            aggregate_results[range_name][calibration] = {}
+            for feature in FEATURES:
+                result = _candidate_result(predictions, range_name, calibration, feature)
+                aggregate_results[range_name][calibration][feature] = result
+                candidates.append({
+                    "gt_range": range_name,
+                    "fit_gt_depth_upper_bound_m": upper_bound,
+                    "calibration": calibration,
+                    "feature": feature,
+                    "result": result,
+                })
+    best_overall = max(candidates, key=lambda candidate: _selection_key(candidate, False))
+    best_boundary = max(candidates, key=lambda candidate: _selection_key(candidate, True))
+    near_report = {
+        "experiment_type": "da2_dense_near_scale_affine_strict_loso",
+        "trt_engine_path": str(engine_path),
+        "trt_engine_sha256": _sha256(engine_path),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": _sha256(manifest_path),
+        "depth_scale": args.depth_scale,
+        "max_timestamp_delta_sec": args.max_timestamp_delta,
+        "roi_rows": list(ROI_ROWS), "roi_cols": list(ROI_COLS),
+        "preprocessing": PREPROCESSING,
+        "fit_gt_ranges": [
+            {"name": range_name, "gt_depth_upper_bound_m": upper_bound}
+            for range_name, upper_bound in GT_RANGES
+        ],
+        "fit_range_only_limits_calibration_pixels": True,
+        "holdout_evaluation_scope": "all frames in each complete held-out sequence",
+        "scale_formula": "a = sum(pred * gt) / sum(pred^2); D_cal = a * D_raw",
+        "affine_formula": "least squares D_cal = a * D_raw + b; a > 0",
+        "threshold_rule": "gt_distance < 2.0; pred_distance < 2.0",
+        "boundary_subset": "1.5 <= gt_distance <= 2.5",
+        "alignment": {
+            "frames": len(alignments), "matched": len(matched),
+            "unmatched": len(alignments) - len(matched),
+            "max_matched_delta_sec": max(matched_deltas) if matched_deltas else None,
+            "mean_matched_delta_sec": float(np.mean(matched_deltas)) if matched_deltas else None,
+        },
+        "sequence_dense_statistics_by_gt_range": {
+            range_name: {
+                sequence: sequence_stats_by_range[range_name][sequence].as_dict()
+                for sequence in SEQUENCES
+            } for range_name, _ in GT_RANGES
+        },
+        "folds_by_gt_range": folds_by_range,
+        "aggregate_out_of_fold_results": aggregate_results,
+        "change_definitions": ["fp_to_tn", "tp_to_fn", "fn_to_tp", "tn_to_fp"],
+        "best_overall": best_overall,
+        "best_boundary": best_boundary,
+        "selection_policy": (
+            "best_overall uses complete held-out aggregate F1, then MAE/RMSE; "
+            "best_boundary is diagnostic only"
+        ),
+    }
+    near_report_path = output_dir / "da2_dense_near_calibration_report.json"
+    with near_report_path.open("w", encoding="utf-8") as stream:
+        json.dump(near_report, stream, indent=2, allow_nan=False)
+        stream.write("\n")
+
     print(f"report={report_path}")
+    print(f"near_report={near_report_path}")
     print(f"predictions={prediction_path}")
     print(f"alignment={alignment_path}")
     return 0
